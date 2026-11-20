@@ -311,7 +311,7 @@ With FAILED non-nil the robot fails instead, and TEXT says why."
 
 (defun syringe-test-start ()
   "Start a review of the last commit and let the robot read the change."
-  (syringe-start syringe-test-root)
+  (syringe-start syringe-test-root "HEAD~1")
   (syringe-test-answer "ready"))
 
 (defun syringe-test-diff ()
@@ -334,7 +334,7 @@ With FAILED non-nil the robot fails instead, and TEXT says why."
     (syringe-test-write "notes.txt" "not committed\n" t)
     (syringe-test-write "fresh.txt" "a new file\n")
     (syringe-test-write "build.log" "a file that git ignores\n")
-    (syringe-start syringe-test-root)
+    (syringe-start syringe-test-root "HEAD~1")
     (should (equal (buffer-name) syringe--diff-buffer))
     (should (derived-mode-p 'syringe-diff-mode))
     (should buffer-read-only)
@@ -353,17 +353,89 @@ With FAILED non-nil the robot fails instead, and TEXT says why."
           (should (string-search (concat "\n" line "\n") diff))))
       (should-not (string-search "build.log" diff)))))
 
+(ert-deftest syringe-test-since ()
+  "A review since a revision shows everything that came after it."
+  (syringe-test-with-repository
+    (syringe-test-write "notes.txt" "fourth note\n" t)
+    (syringe-test-git "commit" "-q" "--all" "-m"
+                      "three\n\nWhy the third commit.")
+    (syringe-test-write "notes.txt" "not committed\n" t)
+    (let ((has (lambda (text)
+                 (string-search text (syringe-test-diff)))))
+      ;; Two commits back: the messages of both, the newer first, then
+      ;; what they changed and the work on top of them.
+      (syringe-start syringe-test-root "HEAD~2")
+      (should (< (funcall has "Why the third commit.")
+                 (funcall has "Why the second commit.")
+                 (funcall has "diff --git")))
+      (dolist (line '("+third note" "+fourth note" "+not committed"))
+        (should (funcall has (concat "\n" line "\n"))))
+      (should (funcall has (concat "\n+" (syringe-test-line 10 "CHANGED ten")
+                                   "\n")))
+      ;; The commit that is checked out: no message, and only the work
+      ;; that is not committed.
+      (syringe-start syringe-test-root "HEAD")
+      (should (string-prefix-p "diff --git" (syringe-test-diff)))
+      (should (funcall has "\n+not committed\n"))
+      (should-not (funcall has "\n+fourth note\n"))
+      ;; A commit that is not an ancestor: it has the files of the first
+      ;; commit and comes after the second.  All that differs from it is
+      ;; shown, under the message of the one commit that is not behind it.
+      (syringe-test-git "branch" "side"
+                        (string-trim
+                         (syringe-test-git "commit-tree" "HEAD~2^{tree}"
+                                           "-p" "HEAD~1" "-m" "side")))
+      (syringe-start syringe-test-root "side")
+      (should (funcall has "Why the third commit."))
+      (should-not (funcall has "Why the second commit."))
+      (dolist (line '("+third note" "+fourth note" "+not committed"))
+        (should (funcall has (concat "\n" line "\n"))))
+      ;; The robot is told the revision.
+      (should (string-search "\"git diff side\""
+                             (nth 1 (car (last syringe-test-sent))))))))
+
+(ert-deftest syringe-test-start-asks ()
+  "The command asks for the revision; none is the unstaged changes."
+  (syringe-test-with-repository
+    (syringe-test-write "notes.txt" "not committed\n" t)
+    (let ((default-directory syringe-test-root)
+          (answer "")
+          (offered nil))
+      (cl-letf (((symbol-function 'read-from-minibuffer)
+                 (lambda (_prompt _initial _keymap _read _history default
+                                  &rest _)
+                   (setq offered default)
+                   answer)))
+        ;; RET alone.
+        (call-interactively #'syringe-start)
+        (should (eq (plist-get syringe--about :kind) 'unstaged))
+        (should-not (string-search "Why the second commit."
+                                   (syringe-test-diff)))
+        ;; M-n would have brought up the last commit.
+        (should (equal offered "HEAD~1"))
+        ;; A revision, with a space typed by accident.
+        (setq answer " HEAD~1 ")
+        (call-interactively #'syringe-start)
+        (should (equal (plist-get syringe--about :kind) "HEAD~1"))
+        (should (string-search "Why the second commit."
+                               (syringe-test-diff)))))
+    ;; A name that is no commit is refused, and the review stays open.
+    (let ((file syringe--file))
+      (should-error (syringe-start syringe-test-root "no-such-commit")
+                    :type 'user-error)
+      (should (equal syringe--file file)))))
+
 (ert-deftest syringe-test-unstaged ()
   "A review of the unstaged changes shows them and the new files only."
   (syringe-test-with-repository
     ;; A clean tree has nothing to review.
-    (should-error (syringe-start-unstaged syringe-test-root)
+    (should-error (syringe-start syringe-test-root)
                   :type 'user-error)
     (syringe-test-write "notes.txt" "staged\n" t)
     (syringe-test-git "add" "notes.txt")
     (syringe-test-write "src/main.rs" "// not staged\n" t)
     (syringe-test-write "fresh.txt" "a new file\n")
-    (syringe-start-unstaged syringe-test-root)
+    (syringe-start syringe-test-root)
     (let ((diff (syringe-test-diff)))
       (should (string-prefix-p "diff --git" diff))
       (should (string-search "\n+// not staged\n" diff))
@@ -837,7 +909,7 @@ the choice has.  Return the choices that were offered, in order."
       (let ((offered (syringe-test-choose
                       0 (lambda () (syringe-restore syringe-test-root)))))
         (should (= (length offered) 1))
-        (should (string-search "last commit" (car offered)))
+        (should (string-search "since HEAD~1" (car offered)))
         (should (string-search "2 conversations" (car offered))))
       (should (equal (mapcar #'syringe-conversation-title
                              syringe--conversations)
@@ -857,26 +929,31 @@ the choice has.  Return the choices that were offered, in order."
     (syringe-test-dot 30)
     (let ((file syringe--file))
       ;; While the review is open:
-      (syringe-start syringe-test-root)
+      (syringe-start syringe-test-root "HEAD~1")
       (should (equal syringe--file file))
       (should (= (length syringe--conversations) 1))
       ;; And after it was closed:
       (syringe--close-review)
-      (syringe-start syringe-test-root)
+      (syringe-start syringe-test-root "HEAD~1")
       (should (equal syringe--file file))
       (should (= (length syringe--conversations) 1))
       (should (equal (syringe-test-dots (syringe-test-main)) '(30)))
       (should-not syringe-test-sent)
       ;; A review of the unstaged changes is another review.
       (syringe-test-write "notes.txt" "not committed\n" t)
-      (syringe-start-unstaged syringe-test-root)
+      (syringe-start syringe-test-root)
       (syringe-test-answer "ready")
       (should-not (equal syringe--file file))
       (should (eq (plist-get syringe--about :kind) 'unstaged))
       (should-not syringe--conversations)
-      (syringe-start syringe-test-root)
+      (syringe-start syringe-test-root "HEAD~1")
       (should (equal syringe--file file))
-      (should (= (length syringe--conversations) 1)))))
+      (should (= (length syringe--conversations) 1))
+      ;; So is a review since another revision, on the same commit.
+      (syringe-start syringe-test-root "HEAD")
+      (should-not (equal syringe--file file))
+      (should (equal (plist-get syringe--about :kind) "HEAD"))
+      (should-not syringe--conversations))))
 
 (ert-deftest syringe-test-diff-follows-code ()
   "The diff is taken again after an edit, and the conversations stay."
@@ -947,7 +1024,7 @@ the choice has.  Return the choices that were offered, in order."
 (ert-deftest syringe-test-robot-reads-change ()
   "When a review starts, one robot session is told to read the change."
   (syringe-test-with-repository
-    (syringe-start syringe-test-root)
+    (syringe-start syringe-test-root "HEAD~1")
     (should (= (length syringe-test-sent) 1))
     (should (equal (caar syringe-test-sent) syringe--base))
     (should (string-search "\"git diff HEAD~1\"" (syringe-test-prompt)))
@@ -958,7 +1035,7 @@ the choice has.  Return the choices that were offered, in order."
     (should (equal (syringe--base-indicator) " [robot: ready]"))
     ;; A review of the unstaged changes names another command.
     (syringe-test-write "notes.txt" "not committed\n" t)
-    (syringe-start-unstaged syringe-test-root)
+    (syringe-start syringe-test-root)
     (should (string-search "\"git diff\"" (syringe-test-prompt)))
     (should-not (string-search "HEAD~1" (syringe-test-prompt)))))
 
@@ -1051,7 +1128,7 @@ the choice has.  Return the choices that were offered, in order."
 (ert-deftest syringe-test-message-waits ()
   "A message that is sent while the robot reads the change waits for that."
   (syringe-test-with-repository
-    (syringe-start syringe-test-root)
+    (syringe-start syringe-test-root "HEAD~1")
     (let ((conversation (syringe-test-dot 30)))
       (syringe-test-say "why?")
       ;; Only the reading of the change is on its way.
@@ -1065,7 +1142,7 @@ the choice has.  Return the choices that were offered, in order."
 (ert-deftest syringe-test-robot-cannot-read-change ()
   "If the robot could not read the change, a message fails and says why."
   (syringe-test-with-repository
-    (syringe-start syringe-test-root)
+    (syringe-start syringe-test-root "HEAD~1")
     (syringe-test-answer "no network" t)
     (should (equal (syringe--base-indicator) " [robot: failed]"))
     (let ((conversation (syringe-test-dot 30)))
@@ -1191,7 +1268,7 @@ code: it was deleted or rewritten.")))
       ;; What the stopped robot still says is ignored.
       (funcall answer-late t "too late")
       (should-not syringe--conversations)
-      (syringe-start syringe-test-root)
+      (syringe-start syringe-test-root "HEAD~1")
       (let ((conversation (car syringe--conversations)))
         (should (eq (syringe-conversation-state conversation) 'error))
         (should (equal (mapcar #'car

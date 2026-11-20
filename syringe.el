@@ -8,7 +8,7 @@
 ;; Syringe helps you understand a change by reading it yourself.
 ;; A review uses three windows:
 ;;
-;;   diff          what changed, under the message of the commit; RET
+;;   diff          what changed, under the messages of its commits; RET
 ;;                 goes to that place in the live code
 ;;   live code     the real files, to read around in and to edit
 ;;   conversation  a chat with the robot about one line
@@ -45,10 +45,9 @@
 ;;
 ;; Commands.  None of them is bound to a key; bind them in your init file.
 ;;
-;;   syringe-start              start a review of the last commit and of
-;;                              the work on top of it that is not committed
-;;   syringe-start-unstaged     start a review of the unstaged changes and
-;;                              the new files
+;;   syringe-start              start a review of what has changed since a
+;;                              revision, such as HEAD~1 for the last commit,
+;;                              or with no revision of what is not staged
 ;;   syringe-toggle-dot         put a dot on this line and open its
 ;;                              conversation, or remove the dot that is there
 ;;   syringe-open-conversation  jump to the closest dot, open its conversation
@@ -199,10 +198,10 @@ see `syringe--news'.")
 
 (defvar syringe--about nil
   "Facts about the current review, a property list.
-:created is when it started and :kind what it reviews, `last-commit'
-or `unstaged'.  :commit is the commit the review belongs to and :head
-its short name and subject.  :changed is non-nil once the diff has
-changed since the robot read it.")
+:created is when it started and :kind what it reviews; see
+`syringe--change-diff'.  :commit is the commit the review belongs to
+and :head its short name and subject.  :changed is non-nil once the
+diff has changed since the robot read it.")
 
 (defvar syringe--refresh-timer nil
   "The timer that takes the diff again once Emacs is idle, or nil.")
@@ -212,6 +211,9 @@ changed since the robot read it.")
 
 (defvar syringe--root nil
   "Root directory of the repository under review.")
+
+(defvar syringe--revision-history nil
+  "The revisions that were typed to start a review, the newest first.")
 
 (defvar syringe--base nil
   "The robot session that read the diff when the review started.
@@ -1339,7 +1341,7 @@ still reading the diff, the message waits for that."
             (unless (eq syringe--base-state 'ready)
               (error "%s" (or syringe--base-error
                               "No review is running; start one with \
-M-x syringe-start or M-x syringe-start-unstaged")))
+M-x syringe-start")))
             (setf (syringe-conversation-session conversation)
                   (syringe-engine-fork syringe--base)))
           (setf (syringe-conversation-process conversation)
@@ -1609,26 +1611,32 @@ Files that git ignores are left out."
                  "\0" t)
    ""))
 
-;; A review has a kind, which says what it reviews: `last-commit' or
-;; `unstaged'.  The two functions below are all that depends on it.
+;; A review has a kind, which says what it reviews.  It is `unstaged'
+;; for the changes that are not staged, or a revision, a string as it
+;; was typed, for everything that has changed since that revision.  The
+;; two functions below are all that depends on it.
 
 (defun syringe--change-diff (root kind)
   "Return the diff that a review of KIND shows for the repository at ROOT.
 It shows the code as it is now: the work that is not committed and
 the files that git does not track are part of it.  A review of the
-last commit starts from the commit before it, a review of the
-unstaged changes from what is staged.
+unstaged changes starts from what is staged, a review since a
+revision from that revision.
 
-A review of the last commit has the message of that commit above the
-diff, as `git log' prints it."
+A review since a revision has the messages of the commits that came
+after it above the diff, as `git log' prints them."
   (concat (pcase kind
             ('unstaged "")
-            (_ (concat (syringe--git root "--no-pager" "log" "-1"
-                                     "--no-color" "--format=medium")
-                       "\n\n")))
+            (_ (let ((log (syringe--git root "--no-pager" "log" "--no-color"
+                                        "--format=medium"
+                                        (concat kind "..HEAD"))))
+                 ;; No commit came after the one that is checked out.
+                 (if (member log '(nil ""))
+                     ""
+                   (concat log "\n\n")))))
           (syringe--git-diff root (pcase kind
                                     ('unstaged nil)
-                                    (_ '("HEAD~1"))))
+                                    (_ (list kind))))
           (syringe--untracked-diff root)))
 
 (defun syringe--change-description (kind)
@@ -1638,12 +1646,14 @@ diff, as `git log' prints it."
 command \"git diff\" prints, run from the root of the repository, together \
 with the new files that git does not track yet; the command \"git ls-files \
 --others --exclude-standard\" lists those.")
-    (_ "The change is the last commit together with my work on top of it \
-that is not committed: what the command \"git diff HEAD~1\" prints, run from \
-the root of the repository, together with the new files that git does not \
-track yet; the command \"git ls-files --others --exclude-standard\" lists \
-those.  The command \"git log -1\" prints the message of the commit; read \
-it too.")))
+    (_ (format "The change is everything between the revision %s and the \
+files as they are now, my work that is not committed included: what the \
+command \"git diff %s\" prints, run from the root of the repository, \
+together with the new files that git does not track yet; the command \"git \
+ls-files --others --exclude-standard\" lists those.  The command \"git log \
+%s..HEAD\" prints the messages of the commits that came after the revision; \
+read them too."
+               kind kind kind))))
 
 (defun syringe--current-p ()
   "Return non-nil if the open review is of the commit that is checked out."
@@ -1728,9 +1738,10 @@ the commit that is checked out? ")
 
 (defun syringe--start (directory kind)
   "Start a review of KIND in the repository that contains DIRECTORY.
-KIND is `last-commit' or `unstaged'.  Show the diff in the selected
-window, or in the window that already shows a diff.  The code and
-conversation windows appear when they are first needed.
+KIND is `unstaged' or a revision; see `syringe--change-diff'.  Show
+the diff in the selected window, or in the window that already shows
+a diff.  The code and conversation windows appear when they are first
+needed.
 
 A review belongs to the commit that is checked out.  If the open
 review is this one already, only take its diff again.  If a review
@@ -1743,7 +1754,7 @@ The review is saved as you go, and its diff follows the code: see
   (let* ((root (syringe--repository directory))
          (commit (syringe--git root "rev-parse" "HEAD"))
          (this (lambda (about)
-                 (and (eq kind (plist-get about :kind))
+                 (and (equal kind (plist-get about :kind))
                       (equal commit (plist-get about :commit)))))
          (saved nil))
     (cond ((and syringe--file
@@ -1765,38 +1776,47 @@ The review is saved as you go, and its diff follows the code: see
            (let ((diff (syringe--change-diff root kind)))
              (when (string-empty-p diff)
                (user-error
+                "Nothing to review: %s"
                 (pcase kind
-                  ('unstaged
-                   "Nothing to review: no unstaged changes and no new files")
-                  (_ "Nothing to review: the last commit and the work on top \
-of it change nothing"))))
+                  ('unstaged "no unstaged changes and no new files")
+                  (_ (format "nothing has changed since %s" kind)))))
              (syringe--new-review root diff kind commit))))
     (syringe--show-diff-buffer)))
 
 ;;;###autoload
-(defun syringe-start (directory)
-  "Start a review of the last commit in the repository of DIRECTORY.
-The diff shows what the commit you have checked out changed, and on
-top of that your work that is not committed, with the new files that
-git does not track.  It is what `git diff HEAD~1' prints, and it is
-taken again whenever a file changes.  To review the commits of a
-branch one by one, check out each in turn and run this.
+(defun syringe-start (directory &optional revision)
+  "Start a review of the changes since REVISION in the repository of DIRECTORY.
+The diff shows everything between REVISION and the files as they are
+now: the commits that came after it, and on top of them your work
+that is not committed, with the new files that git does not track.
+It is what `git diff REVISION' prints, and it is taken again whenever
+a file changes.  REVISION can be anything that names a commit, and
+the commit need not be an ancestor of the one that is checked out.
+HEAD~1 reviews the last commit; to review the commits of a branch
+one by one, check out each in turn and run this.
+
+With REVISION nil or empty, review the unstaged changes: what `git
+diff' prints without a revision, and the new files.  What you have
+staged is then left out.
+
+Interactively, ask for the revision.  RET alone takes none, and M-n
+brings up HEAD~1.
 
 See `syringe--start' for what starting a review does."
-  (interactive (list (syringe--read-directory)))
-  (syringe--start directory 'last-commit))
-
-;;;###autoload
-(defun syringe-start-unstaged (directory)
-  "Start a review of the uncommitted work in the repository of DIRECTORY.
-The diff shows the unstaged changes, as `git diff' prints them, and
-every new file that git does not track yet, shown as added.  Files
-that git ignores are left out, and so is what you have staged.  The
-diff is taken again whenever a file changes.
-
-See `syringe--start' for what starting a review does."
-  (interactive (list (syringe--read-directory)))
-  (syringe--start directory 'unstaged))
+  (interactive
+   (list (syringe--read-directory)
+         (read-from-minibuffer
+          "Review the changes since revision (none: the unstaged changes): "
+          nil nil nil 'syringe--revision-history "HEAD~1")))
+  (let ((revision (string-trim (or revision ""))))
+    (cond ((string-empty-p revision)
+           (syringe--start directory 'unstaged))
+          ((syringe--git (syringe--repository directory)
+                         "rev-parse" "--verify" "--quiet"
+                         (concat revision "^{commit}"))
+           (syringe--start directory revision))
+          (t
+           (user-error "No commit is called %s" revision)))))
 
 ;;;; Saved reviews
 
@@ -1930,8 +1950,8 @@ answered.  Send your message again.")))))
 
 (defun syringe--new-review (root diff kind commit)
   "Start a review of DIFF, a diff of the repository at ROOT.
-KIND is the kind of the review, `last-commit' or `unstaged'.  COMMIT
-is the commit that is checked out, which the review belongs to."
+KIND is the kind of the review; see `syringe--change-diff'.  COMMIT is
+the commit that is checked out, which the review belongs to."
   (syringe--close-review)
   (let* ((directory (syringe--directory root))
          (name (format-time-string "%Y%m%d-%H%M%S"))
@@ -1988,11 +2008,12 @@ That is when it started, what it reviews, the commit that was
 checked out and the number of conversations."
   (let* ((data (read (syringe--read-text file)))
          (about (plist-get data :about)))
-    (format "%s  %-11s  %s  %d conversations"
+    (format "%s  %-18s  %s  %d conversations"
             (plist-get about :created)
             (pcase (plist-get about :kind)
               ('unstaged "unstaged")
-              (_ "last commit"))
+              (revision (truncate-string-to-width
+                         (format "since %s" revision) 18 nil nil t)))
             (truncate-string-to-width (or (plist-get about :head) "")
                                       50 nil nil t)
             (length (plist-get data :conversations)))))
