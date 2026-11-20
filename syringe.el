@@ -8,6 +8,7 @@
 ;;
 ;;   syringe-start-last-commit  start a review of the last commit and of
 ;;                              the work on top of it that is not committed
+;;   syringe-start-unstaged     start a review of the unstaged changes
 
 ;;; Code:
 
@@ -64,20 +65,30 @@ current directory is in no git repository."
       default-directory
     (read-directory-name "Git repository: ")))
 
-(defun syringe--change-diff (root)
-  "Return the diff that a review shows for the repository at ROOT.
-It shows the code as it is now: the work that is not committed is
-part of it.  The review starts from the commit before the last one."
-  (syringe--git-diff root '("HEAD~1")))
+;; A review has a kind, which says what it reviews: `last-commit' or
+;; `unstaged'.
 
-(defun syringe--start (directory)
-  "Start a review in the repository that contains DIRECTORY.
-Show the diff in the selected window."
+(defun syringe--change-diff (root kind)
+  "Return the diff that a review of KIND shows for the repository at ROOT.
+It shows the code as it is now: the work that is not committed is
+part of it.  A review of the last commit starts from the commit
+before it, a review of the unstaged changes from what is staged."
+  (syringe--git-diff root (pcase kind
+                            ('unstaged nil)
+                            (_ '("HEAD~1")))))
+
+(defun syringe--start (directory kind)
+  "Start a review of KIND in the repository that contains DIRECTORY.
+KIND is `last-commit' or `unstaged'.  Show the diff in the selected
+window."
   (let* ((root (syringe--repository directory))
-         (diff (syringe--change-diff root)))
+         (diff (syringe--change-diff root kind)))
     (when (string-empty-p diff)
-      (user-error "Nothing to review: the last commit and the work on top \
-of it change nothing"))
+      (user-error
+       (pcase kind
+         ('unstaged "Nothing to review: no unstaged changes")
+         (_ "Nothing to review: the last commit and the work on top \
+of it change nothing"))))
     (syringe--fill-diff-buffer diff root)
     (switch-to-buffer syringe--diff-buffer)))
 
@@ -90,7 +101,16 @@ out each in turn and run this.
 
 See `syringe--start' for what starting a review does."
   (interactive (list (syringe--read-directory)))
-  (syringe--start directory))
+  (syringe--start directory 'last-commit))
+
+(defun syringe-start-unstaged (directory)
+  "Start a review of the uncommitted work in the repository of DIRECTORY.
+The diff shows the unstaged changes, as `git diff' prints them.  What
+you have staged is left out.
+
+See `syringe--start' for what starting a review does."
+  (interactive (list (syringe--read-directory)))
+  (syringe--start directory 'unstaged))
 
 (provide 'syringe)
 ;;; syringe.el ends here
