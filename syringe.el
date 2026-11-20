@@ -746,9 +746,14 @@ in the diff and in the live code, it gets a dot in both places, with
 the same conversation.
 
 Removing a dot removes its twin and their conversation; this asks
-first when the conversation has messages."
+first when the conversation has messages.  In a conversation window,
+remove that conversation: that is how to get rid of one whose line
+is lost and has no dot."
   (interactive)
-  (let ((conversation (syringe--conversation-at-line)))
+  (let ((conversation (if (derived-mode-p 'syringe-chat-mode)
+                          (buffer-local-value 'syringe--conversation
+                                              (current-buffer))
+                        (syringe--conversation-at-line))))
     (cond ((null conversation)
            (syringe--open-chat (syringe--add-dot)))
           ((or (null (syringe-conversation-messages conversation))
