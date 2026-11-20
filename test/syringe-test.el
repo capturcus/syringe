@@ -652,5 +652,103 @@ diff --git a/two.txt b/two.txt
         ;; The cursor stays in the code.
         (should (eq (syringe--window-role (selected-window)) 'code))))))
 
+;;;; Dots that follow their lines
+
+(defun syringe-test-edit-main (function)
+  "Call FUNCTION at the start of the buffer of src/main.rs, then save it."
+  (with-current-buffer (syringe-test-main)
+    (goto-char (point-min))
+    (funcall function)
+    (save-buffer)))
+
+(ert-deftest syringe-test-line-edited ()
+  "A dot stays with its line through edits, and so does the name."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((conversation (syringe-test-dot 30)))
+      (syringe-test-edit-main (lambda () (insert "// one\n// two\n")))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(32)))
+      (should (= (syringe-conversation-code-line conversation) 32))
+      (should (equal (syringe-conversation-title conversation)
+                     "src/main.rs:32"))
+      (should (equal (buffer-name (syringe-conversation-buffer conversation))
+                     "*syringe: src/main.rs:32*"))
+      ;; A line that is reworded under its dot is still the line.
+      (syringe-test-edit-main (lambda ()
+                                (search-forward "line 30")
+                                (replace-match "another text")))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(32)))
+      (should (equal (syringe-conversation-code-text conversation)
+                     (syringe-test-line 30 "another text")))
+      (should-not (syringe-conversation-lost conversation)))))
+
+(ert-deftest syringe-test-line-moved ()
+  "A line that is cut and pasted elsewhere takes its dot along."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((conversation (syringe-test-dot 30)))
+      (syringe-test-edit-main
+       (lambda ()
+         (forward-line 29)
+         (let ((line (delete-and-extract-region (pos-bol) (pos-bol 2))))
+           (goto-char (point-min))
+           (forward-line 4)
+           (insert line))))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(5)))
+      (should (= (syringe-conversation-code-line conversation) 5))
+      (should-not (syringe-conversation-lost conversation)))))
+
+(ert-deftest syringe-test-line-lost ()
+  "A dot whose line is deleted turns gray, until the line is back."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((conversation (syringe-test-dot 30)))
+      (syringe-test-edit-main (lambda ()
+                                (forward-line 29)
+                                (delete-region (pos-bol) (pos-bol 2))))
+      (should (syringe-conversation-lost conversation))
+      (should (eq (syringe--dot-face conversation) 'syringe-dot-lost))
+      ;; The dot stays where the line was, and the line is not forgotten.
+      (should (equal (syringe-test-dots (syringe-test-main)) '(30)))
+      (should (equal (syringe-conversation-code-text conversation)
+                     (syringe-test-line 30)))
+      (syringe-test-edit-main (lambda ()
+                                (forward-line 29)
+                                (insert (syringe-test-line 30) "\n")))
+      (should-not (syringe-conversation-lost conversation))
+      (should (eq (syringe--dot-face conversation) 'syringe-dot))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(30))))))
+
+(ert-deftest syringe-test-file-changed-on-disk ()
+  "After a file is read again from disk, its dots are on their lines."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((kept (syringe-test-dot 10))
+          (deleted (syringe-test-dot 30))
+          (text (with-current-buffer (syringe-test-main) (buffer-string))))
+      (syringe-test-write "src/main.rs"
+                          (concat "// one\n// two\n// three\n"
+                                  (string-replace
+                                   (concat (syringe-test-line 30) "\n") ""
+                                   text)))
+      (with-current-buffer (syringe-test-main)
+        (revert-buffer t t))
+      (should (= (syringe-conversation-code-line kept) 13))
+      (should-not (syringe-conversation-lost kept))
+      (should (syringe-conversation-lost deleted))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(13 30))))))
+
+(ert-deftest syringe-test-file-visited-again ()
+  "The dots of a file are back when the file is visited again."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((conversations (mapcar #'syringe-test-dot '(10 30))))
+      (kill-buffer (syringe-test-main))
+      (dolist (conversation conversations)
+        (should-not (syringe--live-dot
+                     (syringe-conversation-code-dot conversation))))
+      (find-file-noselect (syringe-test-path "src/main.rs"))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(10 30))))))
+
 (provide 'syringe-test)
 ;;; syringe-test.el ends here
