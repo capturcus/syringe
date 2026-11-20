@@ -1171,7 +1171,7 @@ The answer arrives in the background."
 ;;;; Talking to the robot
 
 ;; This part decides what to tell the robot and what to do with its
-;; answers.  It reaches the robot only through the three functions of
+;; answers.  It reaches the robot only through the two functions of
 ;; the engine, at the end of this file.
 
 (defun syringe--prepare-base ()
@@ -2021,13 +2021,11 @@ that is checked out.  The dots go to where their lines are now."
 
 ;;;; The engine: GitHub Copilot CLI
 
-;; Everything above reaches the robot through three functions only:
+;; Everything above reaches the robot through two functions only:
 ;;
 ;;   (syringe-engine-new-session)
 ;;       Return a new session.  A session is a string that names one
 ;;       conversation with the robot.
-;;   (syringe-engine-fork SESSION)
-;;       Return a new session that continues from a copy of SESSION.
 ;;   (syringe-engine-send SESSION PROMPT DIRECTORY ON-ACTIVITY ON-DONE)
 ;;       Send PROMPT in SESSION, with the robot working in DIRECTORY.
 ;;       Return at once with the process.  While the robot works, call
@@ -2035,7 +2033,7 @@ that is checked out.  The dots go to where their lines are now."
 ;;       end call ON-DONE with t and the answer, or with nil and the
 ;;       reason for the failure.
 ;;
-;; To use another coding agent, rewrite these three functions.
+;; To use another coding agent, rewrite these two functions.
 
 (defcustom syringe-copilot-program "copilot"
   "The GitHub Copilot CLI program."
@@ -2065,28 +2063,6 @@ To choose the model, add \"--model\" and its name."
           (random #x100000000) (random #x10000) (random #x1000)
           (+ #x8000 (random #x4000))
           (random #x1000000) (random #x1000000)))
-
-(defun syringe-engine-fork (session)
-  "Return a new session that continues from a copy of SESSION.
-Copilot can fork a session only from its interactive prompt, so this
-copies the directory where Copilot keeps the session and renames the
-session inside the two files that hold its name.  It relies on how
-Copilot 1.0 stores sessions, which its documentation does not promise."
-  (let* ((new (syringe-engine-new-session))
-         (store (expand-file-name "session-state"
-                                  (or (getenv "COPILOT_HOME") "~/.copilot")))
-         (to (expand-file-name new store)))
-    (copy-directory (expand-file-name session store) to)
-    (dolist (name '("workspace.yaml" "events.jsonl"))
-      (let ((file (expand-file-name name to))
-            (coding-system-for-read 'utf-8)
-            (coding-system-for-write 'utf-8))
-        (with-temp-buffer
-          (insert-file-contents file)
-          (while (search-forward session nil t)
-            (replace-match new t t))
-          (write-region nil nil file nil 'silent))))
-    new))
 
 (defun syringe-copilot--activity (data directory)
   "Describe the tool call DATA of a Copilot event in a few words.

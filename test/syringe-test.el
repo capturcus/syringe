@@ -277,9 +277,6 @@ question of `y-or-n-p' is answered with `syringe-test-yes'."
          (inhibit-message t))
     (cl-letf (((symbol-function 'syringe-engine-new-session)
                (lambda () (format "session-%d" (cl-incf sessions))))
-              ((symbol-function 'syringe-engine-fork)
-               (lambda (session)
-                 (format "%s/fork-%d" session (cl-incf sessions))))
               ((symbol-function 'syringe-engine-send)
                (lambda (session prompt _directory on-activity on-done)
                  (setq syringe-test-sent
@@ -1317,8 +1314,7 @@ code: it was deleted or rewritten.")))
 ;;;; The engine
 
 ;; These tests run the real functions of the engine, with a shell
-;; script in the place of Copilot and a scratch directory in the place
-;; of the one where Copilot keeps its sessions.
+;; script in the place of Copilot.
 
 (defun syringe-test-run-engine (script)
   "Send a prompt with `syringe-engine-send' to SCRIPT in place of Copilot.
@@ -1400,39 +1396,6 @@ END
                    (any "89ab") (= 3 hex) "-" (= 12 hex) eos)
                session)))
     (should (= (length (delete-dups sessions)) 200))))
-
-(ert-deftest syringe-test-engine-fork ()
-  "A fork is a copy of the files of a session under a new name."
-  (ert-with-temp-directory home
-    (let* ((process-environment
-            (cons (concat "COPILOT_HOME=" home) process-environment))
-           (session "11111111-2222-4333-8444-555555555555")
-           (read (lambda (session file)
-                   (with-temp-buffer
-                     (insert-file-contents
-                      (expand-file-name
-                       (file-name-concat "session-state" session file)
-                       home))
-                     (buffer-string))))
-           (files `(("workspace.yaml" . ,(format "id: %s\ncwd: /repo\n"
-                                                 session))
-                    ("events.jsonl" . ,(format "{\"sessionId\":\"%s\"}\n\
-{\"parent\":\"%s\"}\n"
-                                               session session))
-                    ("other.txt" . "kept as it is\n"))))
-      (make-directory (file-name-concat home "session-state" session) t)
-      (pcase-dolist (`(,file . ,text) files)
-        (write-region text nil
-                      (file-name-concat home "session-state" session file)
-                      nil 'silent))
-      (let ((fork (syringe-engine-fork session)))
-        (should-not (equal fork session))
-        (pcase-dolist (`(,file . ,text) files)
-          ;; The fork goes by its own name wherever the session is named.
-          (should (equal (funcall read fork file)
-                         (string-replace session fork text)))
-          ;; The session it was copied from is as it was.
-          (should (equal (funcall read session file) text)))))))
 
 (ert-deftest syringe-test-engine-activity ()
   "What the robot is doing is told in a few words, on one line."
