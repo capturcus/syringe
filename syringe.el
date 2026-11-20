@@ -579,6 +579,7 @@ line shows it."
   (let ((buffer (syringe-conversation-buffer conversation)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
+        (syringe--show-prompt)
         (force-mode-line-update)))))
 
 (defun syringe--mark-read (conversation)
@@ -846,6 +847,9 @@ With SELECT non-nil, go to that window too."
 (defconst syringe--prompt "> "
   "The prompt shown before the text being typed.")
 
+(defconst syringe--prompt-thinking "..."
+  "What is shown in place of the prompt while the robot thinks.")
+
 (defvar-local syringe--conversation nil
   "The conversation that this buffer shows.")
 
@@ -857,7 +861,8 @@ With SELECT non-nil, go to that window too."
 
 (define-derived-mode syringe-chat-mode nil "Syringe-Chat"
   "Major mode for a syringe conversation.
-Type after the prompt and press RET to send the message."
+Type after the prompt and press RET to send the message.  While the
+robot thinks, the prompt shows ... and nothing can be typed."
   (setq-local word-wrap t)
   (setq-local truncate-lines nil)
   (add-hook 'kill-buffer-hook #'syringe--leave-windows nil t)
@@ -870,6 +875,23 @@ Type after the prompt and press RET to send the message."
                                             (window-buffer window))))
       (when conversation
         (syringe--mark-read conversation)))))
+
+(defun syringe--show-prompt ()
+  "Make the prompt and this buffer fit the state of the conversation.
+While the robot thinks, the prompt shows ... and the buffer is
+read-only, so that nothing can be typed.  The text of the prompt
+stays as it is; a `display' property shows the dots in its place."
+  (when (markerp syringe--input-start)
+    (let ((thinking (eq (syringe-conversation-state syringe--conversation)
+                        'thinking))
+          (inhibit-read-only t))
+      (setq buffer-read-only thinking)
+      (put-text-property (- syringe--input-start (length syringe--prompt))
+                         syringe--input-start
+                         'display
+                         (and thinking
+                              (propertize syringe--prompt-thinking
+                                          'face 'syringe-prompt))))))
 
 (defun syringe--chat-header ()
   "Return the header line of a conversation buffer.
@@ -970,7 +992,8 @@ The answer arrives in the background."
         (setq syringe--input-start (point-marker))
         (pcase-dolist (`(,role . ,text)
                        (syringe-conversation-messages conversation))
-          (syringe--render-message role text))))
+          (syringe--render-message role text))
+        (syringe--show-prompt)))
     buffer))
 
 (defun syringe--open-chat (conversation)
