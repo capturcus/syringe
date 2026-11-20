@@ -34,6 +34,8 @@
 ;; Every conversation continues from a copy of that session.  Each
 ;; message also tells the robot what was said in the other
 ;; conversations since, so that all of them share what was learned.
+;; In an answer, a reference such as src/main.c:42 is a link: move the
+;; cursor onto it and press RET to go to that line in the live code.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -90,7 +92,7 @@ Rules:
   commands to find things out.
 - Refer to code as path:line, for example src/main.c:42, with the path
   relative to the root of the repository and the line numbers of the
-  files as they are now.
+  files as they are now.  I can jump to such a reference.
 - Be brief.  Write plain text: no headings and no tables.
 - I edit the code while we talk.  Before you rely on something you
   read earlier, read the file again.
@@ -947,17 +949,62 @@ the window if there is none."
 
 (defun syringe--render-message (role text)
   "Insert the message TEXT, written by ROLE, just above the prompt.
-The color tells who wrote it."
+The color tells who wrote it.  In a message of the robot, references
+to lines of code become links."
   (let ((inhibit-read-only t))
     (save-excursion
       (goto-char (- syringe--input-start (length syringe--prompt)))
-      (insert (propertize (concat text "\n")
-                          'face (pcase role
-                                  ('user 'syringe-user)
-                                  ('robot 'syringe-robot)
-                                  (_ 'syringe-error))
-                          'read-only t
-                          'front-sticky '(read-only))))))
+      (let ((start (point)))
+        (insert (propertize (concat text "\n")
+                            'face (pcase role
+                                    ('user 'syringe-user)
+                                    ('robot 'syringe-robot)
+                                    (_ 'syringe-error))
+                            'read-only t
+                            'front-sticky '(read-only)))
+        (when (eq role 'robot)
+          (syringe--add-links start (point)))))))
+
+(defun syringe--add-links (start end)
+  "Turn references such as src/main.c:42 between START and END into links.
+RET on a link goes to that line in the live code."
+  (when syringe--root
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward "\\([[:alnum:]_./-]+\\):\\([0-9]+\\)" end t)
+        (let ((file (expand-file-name (match-string 1) syringe--root))
+              (line (string-to-number (match-string 2))))
+          ;; Only what names a real file is a reference.
+          (when (file-regular-p file)
+            (make-text-button (match-beginning 0) (match-end 0)
+                              'face '(button syringe-robot)
+                              'help-echo "RET: go to this line"
+                              'follow-link t
+                              'action (lambda (_button)
+                                        (syringe--visit file line)))))))))
+
+(defun syringe--visit (file line)
+  "Go to LINE of FILE in the code window."
+  (let ((buffer (find-file-noselect file)))
+    (syringe--show-code buffer
+                        (with-current-buffer buffer
+                          (syringe--line-start (1- line)))
+                        t)))
+
+(defun syringe-next-link ()
+  "Move to the next link in the conversation.
+A link is a reference to a line of code in an answer of the robot;
+RET on it goes to that line.  After the last link comes the first."
+  (interactive)
+  (or (forward-button 1 t nil t)
+      (user-error "This conversation has no links")))
+
+(defun syringe-previous-link ()
+  "Move to the previous link in the conversation.
+Before the first link comes the last.  See `syringe-next-link'."
+  (interactive)
+  (or (forward-button -1 t nil t)
+      (user-error "This conversation has no links")))
 
 (defun syringe--say (conversation role text)
   "Add the message TEXT, written by ROLE, to CONVERSATION.
