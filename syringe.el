@@ -14,7 +14,12 @@
 ;; line that is both in the diff and in the live code has a dot in both
 ;; places, and the two dots share one conversation.  When point comes
 ;; to a line with a dot, the conversation window shows that
-;; conversation.
+;; conversation.  A gray dot marks a line that is lost: it was deleted
+;; or rewritten beyond recognition.
+;;
+;; A dot follows its line: a conversation remembers the text of its
+;; line and of the lines around it, and looks for the line again when
+;; the code changes.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -51,6 +56,9 @@ When nil, the code window shows the place but the cursor stays in the diff."
 (defface syringe-dot '((t :foreground "DodgerBlue" :weight bold))
   "Face of a dot in the left margin.")
 
+(defface syringe-dot-lost '((t :foreground "gray50" :weight bold))
+  "Face of a dot whose line is not found in the code any more.")
+
 (defface syringe-user '((t :inherit font-lock-keyword-face))
   "Face of your messages in a conversation.")
 
@@ -74,10 +82,14 @@ on the same line in the live code."
   buffer           ; the buffer that shows the conversation, or nil
   diff-dot         ; the dot in the diff, or nil
   code-dot         ; the dot in the live code, or nil
-  ;; The line in the code, to find the same line in the diff.
+  ;; The line as it was last seen in the code, to find it again when
+  ;; the code has changed; see `syringe--find-code-line'.
   code-file        ; its file, relative to the root, or nil
   code-line        ; its line number
-  code-text)       ; its text
+  code-text        ; its text
+  code-above       ; the lines above it, the nearest first
+  code-below       ; the lines below it, the nearest first
+  lost)            ; non-nil when the line is not found any more
 
 (defvar syringe--conversations nil
   "Every conversation, newest first.")
@@ -152,6 +164,40 @@ Do nothing if that line already has a dot."
           (syringe--draw-dot dot)
           (syringe--sync))))))
 
+;;;; Finding a line again
+
+;; While you type, a dot moves with its line by itself.  That is not
+;; enough: a line can be killed and yanked somewhere else, and a file
+;; can be read again from disk after another program changed it, which
+;; leaves every dot of its buffer in the wrong place.  So a
+;; conversation remembers its line, with a few lines around it, and
+;; looks for it again:
+;;
+;; - when you save the file: a dot that is still on a line is believed,
+;;   and what is remembered is brought up to date; a dot whose line was
+;;   killed is looked for;
+;; - when the file is read again from disk or visited: every line is
+;;   looked for.
+;;
+;; What is remembered changes only when the line is found.  A line that
+;; is not found is lost: its dot turns gray and stays near where the
+;; line was, and the line is looked for again the next time.
+
+(defconst syringe--context 3
+  "How many lines above and below a line are remembered with it.")
+
+(defconst syringe--reach 30
+  "How far from its old place a rewritten line is looked for, in lines.")
+
+(defconst syringe--telling-length 4
+  "How long a line must be, without the space at its ends, to tell a place.")
+
+(defconst syringe--likeness-needed 0.6
+  "How alike a rewritten line must be to the remembered one, from 0 to 1.")
+
+(defconst syringe--likeness-margin 0.15
+  "By how much the most alike line must beat every other line near it.")
+
 (defun syringe--lines ()
   "Return the lines of the current buffer as a vector of strings."
   (save-restriction
@@ -176,21 +222,227 @@ The first line is line 0."
        buffer-file-name
        (file-in-directory-p buffer-file-name syringe--root)))
 
+(defun syringe--retitle (conversation title)
+  "Give CONVERSATION the TITLE, and its buffer the name that goes with it."
+  (unless (equal title (syringe-conversation-title conversation))
+    (setf (syringe-conversation-title conversation) title)
+    (let ((buffer (syringe-conversation-buffer conversation)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (rename-buffer (format "*syringe: %s*" title) t)
+          (force-mode-line-update))))))
+
 (defun syringe--remember-code-line (conversation lines index)
   "Remember line INDEX of LINES as the line of CONVERSATION.
 LINES are the lines of the current buffer, which visits a file of
-the review."
-  (setf (syringe-conversation-code-file conversation)
-        (file-relative-name buffer-file-name syringe--root)
-        (syringe-conversation-code-line conversation) (1+ index)
-        (syringe-conversation-code-text conversation) (aref lines index)))
+the review.  The conversation is then not lost, and its title says
+where the line is."
+  (let ((file (file-relative-name buffer-file-name syringe--root))
+        (count (length lines)))
+    (setf (syringe-conversation-code-file conversation) file
+          (syringe-conversation-code-line conversation) (1+ index)
+          (syringe-conversation-code-text conversation) (aref lines index)
+          (syringe-conversation-code-above conversation)
+          (cl-loop for k from 1 to syringe--context
+                   when (>= (- index k) 0)
+                   collect (aref lines (- index k)))
+          (syringe-conversation-code-below conversation)
+          (cl-loop for k from 1 to syringe--context
+                   when (< (+ index k) count)
+                   collect (aref lines (+ index k)))
+          (syringe-conversation-lost conversation) nil)
+    (syringe--retitle conversation (format "%s:%d" file (1+ index)))))
+
+(defun syringe--telling-p (text)
+  "Return non-nil if the line TEXT says enough to know a place by.
+A blank line or a closing brace is everywhere."
+  (>= (length (string-trim text)) syringe--telling-length))
+
+(defun syringe--likeness (a b)
+  "Return how alike the lines A and B are, from 0 to 1.
+The space at their ends does not count, so a line that was only
+indented differently is 1."
+  (let* ((a (string-trim a))
+         (b (string-trim b))
+         (longest (max (length a) (length b))))
+    (if (zerop longest)
+        0.0
+      (- 1.0 (/ (float (string-distance a b)) longest)))))
+
+(defun syringe--find-code-line (conversation lines)
+  "Return the index in LINES of the line of CONVERSATION, or nil.
+LINES are the lines of its file as they are now.  The line is looked
+for with what the conversation remembers of it, from strict to loose:
+
+1. the line where it was, with the same lines around it;
+2. a line that reads the same: the one with the most remembered
+   neighbours around it, then the one nearest to where it was;
+3. a line that has remembered neighbours on both sides, when the line
+   itself was rewritten;
+4. the line most like it, near where it was, if no other line there
+   is nearly as much like it.
+
+A short line, such as a closing brace, is found only by its
+neighbours, and short neighbours do not count."
+  (let* ((text (syringe-conversation-code-text conversation))
+         (was (1- (syringe-conversation-code-line conversation)))
+         (count (length lines))
+         ;; How many of NEIGHBOURS are in their places next to line
+         ;; INDEX, going in DIRECTION: -1 is up, 1 is down.  With EVERY,
+         ;; short neighbours count too.
+         (beside
+          (lambda (index neighbours direction &optional every)
+            (cl-loop for neighbour in neighbours
+                     for place = (+ index direction) then (+ place direction)
+                     count (and (or every (syringe--telling-p neighbour))
+                                (< -1 place count)
+                                (equal neighbour (aref lines place))))))
+         (above (lambda (index &optional every)
+                  (funcall beside index
+                           (syringe-conversation-code-above conversation)
+                           -1 every)))
+         (below (lambda (index &optional every)
+                  (funcall beside index
+                           (syringe-conversation-code-below conversation)
+                           1 every)))
+         (around (lambda (index)
+                   (+ (funcall above index) (funcall below index))))
+         ;; Of the lines CANDIDATES, the one with the most neighbours,
+         ;; then the one nearest to where the line was.
+         (best
+          (lambda (candidates)
+            (car (sort candidates
+                       (lambda (a b)
+                         (let ((around-a (funcall around a))
+                               (around-b (funcall around b)))
+                           (or (> around-a around-b)
+                               (and (= around-a around-b)
+                                    (< (abs (- a was)) (abs (- b was)))))))))))
+         (same (cl-loop for index below count
+                        when (equal text (aref lines index))
+                        collect index)))
+    (or
+     ;; 1. Nothing has changed around the line.
+     (and (memq was same)
+          (= (funcall above was t)
+             (length (syringe-conversation-code-above conversation)))
+          (= (funcall below was t)
+             (length (syringe-conversation-code-below conversation)))
+          was)
+     ;; 2. A line that reads the same.
+     (funcall best
+              (if (syringe--telling-p text)
+                  same
+                (seq-filter (lambda (index) (> (funcall around index) 0))
+                            same)))
+     ;; 3. A rewritten line between its old neighbours.  Neighbours on
+     ;; one side only are what a killed line leaves behind.
+     (funcall best
+              (cl-loop for index below count
+                       when (and (> (funcall above index) 0)
+                                 (> (funcall below index) 0))
+                       collect index))
+     ;; 4. The line most like it, near where it was.  In code that
+     ;; repeats itself many lines are alike, and the line may as well
+     ;; have been killed; so the line must stand out from the rest.
+     (and (syringe--telling-p text)
+          (let ((found nil)
+                (most 0.0)
+                (next 0.0))
+            (cl-loop for index from (max 0 (- was syringe--reach))
+                     to (min (1- count) (+ was syringe--reach))
+                     for likeness = (syringe--likeness text (aref lines index))
+                     do (cond ((> likeness most)
+                               (setq next most
+                                     most likeness
+                                     found index))
+                              ((> likeness next)
+                               (setq next likeness))))
+            (and (> most syringe--likeness-needed)
+                 (> (- most next) syringe--likeness-margin)
+                 found))))))
+
+(defun syringe--settle-buffer (&optional reloaded)
+  "Bring the dots of the current buffer in line with its text.
+This concerns every conversation whose line is in this file.  If its
+dot is still on a line, that line is its line, however it reads now,
+and is remembered afresh.  If its dot has no line left, because the
+line was killed, or if it has no dot here, the line is looked for
+with `syringe--find-code-line'.  A line that is found gets the dot.
+A line that is not found is lost: the dot stays near where the line
+was and turns gray, and what is remembered is kept.
+
+RELOADED non-nil means that the buffer has just been read from its
+file.  Then no dot is where it belongs, and every line is looked for."
+  (when (and buffer-file-name syringe--root)
+    (let ((file (file-relative-name buffer-file-name syringe--root))
+          (lines nil))
+      (dolist (conversation syringe--conversations)
+        (when (equal file (syringe-conversation-code-file conversation))
+          (unless lines
+            (setq lines (syringe--lines)))
+          (let* ((dot (syringe--live-dot
+                       (syringe-conversation-code-dot conversation)))
+                 (dot (and dot (eq (overlay-buffer dot) (current-buffer)) dot))
+                 ;; The line under the dot, unless the dot is out of place.
+                 (under (and dot (not reloaded)
+                             (1- (line-number-at-pos (overlay-start dot) t))))
+                 (index (if (and under
+                                 (not (syringe-conversation-lost conversation))
+                                 ;; An empty dot is all that is left of a
+                                 ;; killed line.
+                                 (< (overlay-start dot) (overlay-end dot)))
+                            under
+                          (syringe--find-code-line conversation lines))))
+            (when dot
+              (delete-overlay dot))
+            (if index
+                (syringe--remember-code-line conversation lines index)
+              (setf (syringe-conversation-lost conversation) t))
+            (syringe--make-dot
+             conversation (current-buffer)
+             (syringe--line-start
+              (or index under
+                  (min (1- (length lines))
+                       (1- (syringe-conversation-code-line conversation)))))))))
+      (when lines
+        (syringe--sync)))))
+
+(defun syringe--file-saved ()
+  "Follow the saving of the current buffer, if its file is in the review.
+Its dots are settled."
+  (when (syringe--in-review-p)
+    (syringe--settle-buffer)))
+
+(defun syringe--file-reloaded ()
+  "Follow the reading of the current buffer from its file again.
+That happens when another program has changed the file."
+  (when (syringe--in-review-p)
+    (syringe--settle-buffer t)))
+
+(defun syringe--file-visited ()
+  "Give the current buffer, whose file was just visited, its dots."
+  (when (syringe--in-review-p)
+    (syringe--settle-buffer t)))
+
+(add-hook 'after-save-hook #'syringe--file-saved)
+(add-hook 'after-revert-hook #'syringe--file-reloaded)
+(add-hook 'find-file-hook #'syringe--file-visited)
+
+(defun syringe--dot-face (conversation)
+  "Return the face of the dots of CONVERSATION.
+It is gray if the line is lost."
+  (if (syringe-conversation-lost conversation)
+      'syringe-dot-lost
+    'syringe-dot))
 
 (defun syringe--draw-dot (dot)
-  "Draw DOT in the left margin."
-  (overlay-put dot 'before-string
-               (propertize "x" 'display
-                           (list '(margin left-margin)
-                                 (propertize "●" 'face 'syringe-dot)))))
+  "Draw DOT in the left margin, in the color of its conversation."
+  (let ((face (syringe--dot-face (overlay-get dot 'syringe-conversation))))
+    (overlay-put dot 'before-string
+                 (propertize "x" 'display
+                             (list '(margin left-margin)
+                                   (propertize "●" 'face face))))))
 
 (defun syringe--live-dots (conversation)
   "Return the dots of CONVERSATION that still mark a line."
@@ -267,7 +519,7 @@ and a conversation window is open."
 (defun syringe--add-code-dot (conversation)
   "Give CONVERSATION, started on the line of the diff at point, a code dot.
 Return non-nil if that worked: the line is an added or unchanged
-line, and its file has it where the diff says.  This visits the file."
+line, and it is found in its file.  This visits the file."
   (pcase (syringe--diff-line-info)
     (`(,file ,number ,(or ?\s ?+))
      (let ((path (expand-file-name file syringe--root))
@@ -275,12 +527,21 @@ line, and its file has it where the diff says.  This visits the file."
        (when (file-regular-p path)
          (with-current-buffer (find-file-noselect path)
            (let ((lines (syringe--lines)))
-             (when (and (<= number (length lines))
-                        (equal text (aref lines (1- number))))
-               (syringe--remember-code-line conversation lines (1- number))
-               (syringe--make-dot conversation (current-buffer)
-                                  (syringe--line-start (1- number)))
-               t))))))))
+             ;; Look for the line as if the diff had been remembered.
+             (setf (syringe-conversation-code-file conversation) file
+                   (syringe-conversation-code-line conversation) number
+                   (syringe-conversation-code-text conversation) text)
+             (let ((index (if (and (<= number (length lines))
+                                   (equal text (aref lines (1- number))))
+                              ;; The diff is fresh: the line is where it says.
+                              (1- number)
+                            (syringe--find-code-line conversation lines))))
+               (if (not index)
+                   (setf (syringe-conversation-code-file conversation) nil)
+                 (syringe--remember-code-line conversation lines index)
+                 (syringe--make-dot conversation (current-buffer)
+                                    (syringe--line-start index))
+                 t)))))))))
 
 (defun syringe--add-dot ()
   "Start a conversation about the current line and return it.
