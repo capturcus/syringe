@@ -1,6 +1,7 @@
 ;;; syringe.el --- Review code in three windows: diff, live code, conversation  -*- lexical-binding: t; -*-
 
 ;; Version: 0.1
+;; Package-Requires: ((emacs "29.1"))
 
 ;;; Commentary:
 
