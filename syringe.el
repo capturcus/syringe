@@ -1883,8 +1883,7 @@ answered.  Send your message again.")))))
 (defun syringe--save ()
   "Save the current review, if there is one, to its file."
   (when syringe--file
-    (let ((data (list :version 1
-                      :about syringe--about
+    (let ((data (list :about syringe--about
                       :session syringe--session
                       :session-ready (eq syringe--session-state 'ready)
                       :conversations (mapcar #'syringe--conversation-data
