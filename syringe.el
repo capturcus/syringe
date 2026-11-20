@@ -1149,13 +1149,28 @@ Several files that change at once then cost one diff."
 
 (defun syringe--refresh-by-hand ()
   "Take the diff of the open review again, because you asked for it.
-A review of another commit than the one that is checked out keeps
-its diff."
+If another commit is checked out than the one the review belongs to,
+offer to carry the review over to that commit."
   (unless syringe--file
     (user-error "No review is open"))
-  (unless (syringe--current-p)
-    (user-error "This review is of another commit than the one checked out"))
-  (syringe--refresh-diff))
+  (if (syringe--current-p)
+      (syringe--refresh-diff)
+    (unless (y-or-n-p "This review is of another commit.  Carry it over to \
+the commit that is checked out? ")
+      (user-error "The review stays with its commit"))
+    (let ((before syringe--about))
+      (setq syringe--about
+            (plist-put (plist-put (copy-sequence before)
+                                  :commit (syringe--git syringe--root
+                                                        "rev-parse" "HEAD"))
+                       :head (syringe--git syringe--root
+                                           "log" "-1" "--format=%h %s")))
+      ;; If the diff cannot be taken, the review stays where it was.
+      (condition-case err
+          (syringe--refresh-diff)
+        (error (setq syringe--about before)
+               (signal (car err) (cdr err))))))
+  (syringe--save))
 
 (defun syringe--start (directory kind)
   "Start a review of KIND in the repository that contains DIRECTORY.
@@ -1396,8 +1411,9 @@ the number of conversations.  The review that was open is saved and
 closed.
 
 The review shows the diff as it was saved.  If the commit it belongs
-to is checked out, the diff is then taken again; if not, it stays.
-The dots go to where their lines are now."
+to is checked out, the diff is then taken again; if not, it stays,
+and `g' in the diff offers to carry the review over to the commit
+that is checked out.  The dots go to where their lines are now."
   (interactive (list default-directory))
   (let* ((root (syringe--repository directory))
          (file (syringe--choose
