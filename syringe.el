@@ -238,6 +238,11 @@ Every conversation continues from a copy of it.")
 (defvar-local syringe--followed-line nil
   "Start of the line point was on when `syringe--follow' last looked.")
 
+(defvar-local syringe--followed-visit nil
+  "The use time of the selected window when `syringe--follow' last looked.
+A window gets a new use time whenever it is selected, so this tells
+a new visit to the window from the one before.")
+
 (defun syringe--dots ()
   "Return the dots of the current buffer, from top to bottom."
   (sort (seq-filter (lambda (ov) (overlay-get ov 'syringe-conversation))
@@ -671,11 +676,15 @@ What was said in it stays in `syringe--log'."
 (defun syringe--follow ()
   "Make the conversation window show the conversation of point's line.
 This runs after every command in a buffer that has dots.  It acts
-only when point has come to a different line, that line has a dot,
-and a conversation window is open."
-  (let ((line (pos-bol)))
-    (unless (eql line syringe--followed-line)
-      (setq syringe--followed-line line)
+only when point has come to a line, that line has a dot, and a
+conversation window is open.  Point comes to a line by moving there,
+or by its window being selected while it is on the line."
+  (let ((line (pos-bol))
+        (visit (window-use-time)))
+    (unless (and (eql line syringe--followed-line)
+                 (eql visit syringe--followed-visit))
+      (setq syringe--followed-line line
+            syringe--followed-visit visit)
       ;; An error here would make Emacs drop this function from the hook.
       (with-demoted-errors "Syringe: %S"
         (when-let* ((conversation (syringe--conversation-at-line))

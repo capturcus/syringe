@@ -653,6 +653,34 @@ diff --git a/two.txt b/two.txt
         ;; The cursor stays in the code.
         (should (eq (syringe--window-role (selected-window)) 'code))))))
 
+(ert-deftest syringe-test-follow-selected-window ()
+  "Going to a window whose point is on a dot shows that conversation."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((in-code (syringe-test-dot 30))
+          (in-diff (progn
+                     (syringe-test-in-diff "-fn function_40")
+                     (syringe-toggle-dot)
+                     (car syringe--conversations)))
+          (shown (lambda ()
+                   (window-buffer (syringe--window 'chat)))))
+      ;; Point stays on its dot in both windows and only the selected
+      ;; window changes, as it does with windmove.
+      (pcase-dolist (`(,role . ,conversation)
+                     `((code . ,in-code) (diff . ,in-diff)
+                       (code . ,in-code) (diff . ,in-diff)))
+        (select-window (syringe--window role))
+        (run-hooks 'post-command-hook)
+        (ert-info ((format "In the %s window" role))
+          (should (eq (funcall shown)
+                      (syringe-conversation-buffer conversation)))))
+      ;; A command that leaves point where it is leaves the conversation
+      ;; window alone, whatever it shows.
+      (set-window-buffer (syringe--window 'chat)
+                         (syringe-conversation-buffer in-code))
+      (run-hooks 'post-command-hook)
+      (should (eq (funcall shown) (syringe-conversation-buffer in-code))))))
+
 ;;;; Dots that follow their lines
 
 (defun syringe-test-edit-main (function)
