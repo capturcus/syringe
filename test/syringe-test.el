@@ -1315,5 +1315,89 @@ END
                        "/repo/"))
               70)))
 
+;;;; The list of dots
+
+(ert-deftest syringe-test-list ()
+  "The list of dots has what needs attention first and jumps to the choice."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-dot 5)
+    (syringe-test-say "what is five?")
+    (syringe-test-answer "a function")
+    (syringe-test-dot 20)
+    (syringe-test-say "what is twenty?")
+    (syringe-test-answer "no network" t)
+    (let ((unread (syringe-test-dot 35)))
+      (syringe-test-say "what is thirty-five?")
+      (syringe-test-in-code "src/main.rs" 1)
+      (syringe-test-answer "a function too")
+      (syringe-test-dot 50)
+      (syringe-test-say "what is fifty?")
+      (syringe-test-in-code "src/main.rs" 1)
+      (let ((offered (syringe-test-choose 0 #'syringe-list-dots)))
+        (should (= (length offered) 4))
+        (pcase-dolist (`(,line . ,parts)
+                       (cl-mapcar
+                        #'cons offered
+                        '(("unread" "src/main.rs:35" "what is thirty-five?")
+                          ("failed" "src/main.rs:20" "what is twenty?")
+                          ("thinking" "src/main.rs:50" "what is fifty?")
+                          ("src/main.rs:5" "what is five?"))))
+          (dolist (part parts)
+            (should (string-search part line)))))
+      ;; The choice was the unread one: point is on its dot, its
+      ;; conversation is shown, and it is read now.
+      (should (eq (current-buffer) (syringe-test-main)))
+      (should (= (line-number-at-pos) 35))
+      (should (eq (window-buffer (syringe--window 'chat))
+                  (syringe-conversation-buffer unread)))
+      (should (eq (syringe-conversation-state unread) 'read)))))
+
+(ert-deftest syringe-test-list-from-diff ()
+  "From the diff the list goes to the dot in the diff, else to the code."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-dot 10)
+    (syringe-test-dot 30)
+    (syringe-test-in-diff "+third note")
+    (syringe-test-choose "src/main.rs:10" #'syringe-list-dots)
+    (should (equal (buffer-name) syringe--diff-buffer))
+    (should (equal (buffer-substring-no-properties (pos-bol) (pos-eol))
+                   (concat "+" (syringe-test-line 10 "CHANGED ten"))))
+    ;; A line that the diff does not have is gone to in its file.
+    (syringe-test-choose "src/main.rs:30" #'syringe-list-dots)
+    (should (eq (current-buffer) (syringe-test-main)))
+    (should (= (line-number-at-pos) 30))
+    ;; From the code, the line that is in both is gone to in the code.
+    (syringe-test-choose "src/main.rs:10" #'syringe-list-dots)
+    (should (eq (current-buffer) (syringe-test-main)))
+    (should (= (line-number-at-pos) 10))))
+
+(ert-deftest syringe-test-conversation-without-dot ()
+  "A conversation whose line left the diff is reached and removed all the same."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-in-diff "-fn function_40")
+    (syringe-toggle-dot)
+    (syringe-test-say "why removed?")
+    (syringe-test-answer "nothing uses it")
+    (let ((conversation (car syringe--conversations)))
+      ;; Put the removed line back: the diff does not have it any more.
+      (syringe-test-in-code "src/main.rs" 1)
+      (syringe-test-edit-main (lambda ()
+                                (forward-line 39)
+                                (insert (syringe-test-line 40) "\n")))
+      (syringe--refresh-if-current)
+      (should (syringe-conversation-lost conversation))
+      (should-not (syringe--live-dots conversation))
+      (let ((offered (syringe-test-choose 0 #'syringe-list-dots)))
+        (should (string-search "lost" (car offered))))
+      ;; Without a dot to go to, the list goes to the conversation.
+      (should (eq syringe--conversation conversation))
+      ;; There the command that removes a dot removes the conversation.
+      (syringe-toggle-dot)
+      (should (= (length syringe-test-asked) 1))
+      (should-not syringe--conversations))))
+
 (provide 'syringe-test)
 ;;; syringe-test.el ends here
