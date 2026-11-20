@@ -23,6 +23,9 @@
 ;; its line: a conversation remembers the text of its line and of the
 ;; lines around it, and looks for the line again when the code changes.
 ;;
+;; The robot is a coding agent that can read the repository but not
+;; change it.  When a review starts, one robot session reads the diff.
+;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
 ;;
@@ -60,6 +63,39 @@
   "Non-nil means RET in the diff also moves the cursor to the code window.
 When nil, the code window shows the place but the cursor stays in the diff."
   :type 'boolean)
+
+(defcustom syringe-brief "\
+You are helping me review a code change in this repository.  %s
+
+Help me think, don't think for me.  I want to understand this code
+myself, so:
+- Answer the question I ask.  Explain what the code does and why, and
+  tell me where to read.
+- Do not judge the change as a whole, and do not list problems I did
+  not ask about.
+- Do not write replacement code unless I ask for it.
+- When you are not sure, say so, and say what you would check.
+
+Rules:
+- Never modify a file.  You may read any file and run read-only
+  commands to find things out.
+- Refer to code as path:line, for example src/main.c:42, with the path
+  relative to the root of the repository and the line numbers of the
+  files as they are now.
+- Be brief.  Write plain text: no headings and no tables.
+- I edit the code while we talk.  Before you rely on something you
+  read earlier, read the file again.
+
+Now read the change and the code around it, so that you are ready for
+questions.  Read all of the change, in several steps if it is long.
+Then reply with the single word: ready"
+  "What the robot is told when a review starts.
+%s stands for a sentence that says how to see the change under review;
+see `syringe--change-description'.
+Every conversation continues from the robot session that read this,
+so it works as the system prompt.  A change here applies to the next
+review, not to the running one."
+  :type 'string)
 
 (defface syringe-dot '((t :foreground "DodgerBlue" :weight bold))
   "Face of a dot in the left margin.")
@@ -124,6 +160,19 @@ its short name and subject.")
 
 (defvar syringe--root nil
   "Root directory of the repository under review.")
+
+(defvar syringe--base nil
+  "The robot session that read the diff when the review started.
+Every conversation continues from a copy of it.")
+
+(defvar syringe--base-state nil
+  "State of `syringe--base': `preparing', `ready', `failed', or nil.")
+
+(defvar syringe--base-process nil
+  "The robot process that reads the diff, while it runs.")
+
+(defvar syringe--base-error nil
+  "Why `syringe--base' failed, a string.")
 
 (defconst syringe--diff-buffer "*syringe-diff*"
   "Name of the buffer that shows the diff under review.")
@@ -846,6 +895,56 @@ ROLE is `user'; nobody else writes yet."
   (select-window (syringe--show (syringe--chat-buffer conversation) 'chat))
   (goto-char (point-max)))
 
+;;;; Talking to the robot
+
+;; This part decides what to tell the robot and what to do with its
+;; answers.  It reaches the robot only through the three functions of
+;; the engine, at the end of this file.
+
+(defun syringe--prepare-base ()
+  "Start the robot session that reads the diff; see `syringe--base'."
+  (let ((old syringe--base-process)
+        (base (syringe-engine-new-session)))
+    (setq syringe--base base
+          syringe--base-state 'preparing
+          syringe--base-error nil)
+    ;; After the new session is set, so that the end of the old one is
+    ;; ignored below.
+    (when (process-live-p old)
+      (delete-process old))
+    (condition-case err
+        (setq syringe--base-process
+              (syringe-engine-send
+               base
+               (format syringe-brief
+                       (syringe--change-description
+                        (plist-get syringe--about :kind)))
+               syringe--root
+               #'ignore
+               (lambda (ok text)
+                 (when (equal base syringe--base)
+                   (syringe--base-done ok text)))))
+      (error (syringe--base-done nil (error-message-string err))))))
+
+(defun syringe--base-done (ok text)
+  "Note that the robot has finished reading the diff.
+OK is non-nil if that worked; if not, TEXT says why."
+  (setq syringe--base-state (if ok 'ready 'failed)
+        syringe--base-error (unless ok
+                              (format "The robot could not read the diff: %s"
+                                      text)))
+  (message "Syringe: %s"
+           (if ok "the robot has read the diff" syringe--base-error))
+  (force-mode-line-update t)
+  (syringe--save))
+
+(defun syringe--base-indicator ()
+  "Return what the mode line of the diff says about the robot."
+  (pcase syringe--base-state
+    ('preparing " [robot: reading the diff]")
+    ('ready " [robot: ready]")
+    ('failed " [robot: failed]")))
+
 ;;;; The diff
 
 (defun syringe--each-diff-line (function)
@@ -998,7 +1097,8 @@ has been edited."
   "Major mode for the diff under review.
 RET goes to the live code for the line at point."
   (setq buffer-read-only t
-        diff-mode-read-only t)
+        diff-mode-read-only t
+        mode-line-process '(:eval (syringe--base-indicator)))
   ;; `g' takes the diff of the review again.
   (setq-local revert-buffer-function
               (lambda (&rest _) (syringe--refresh-by-hand))))
@@ -1073,7 +1173,7 @@ Files that git ignores are left out."
    ""))
 
 ;; A review has a kind, which says what it reviews: `last-commit' or
-;; `unstaged'.
+;; `unstaged'.  The two functions below are all that depends on it.
 
 (defun syringe--change-diff (root kind)
   "Return the diff that a review of KIND shows for the repository at ROOT.
@@ -1093,6 +1193,20 @@ diff, as `git log' prints it."
                                     ('unstaged nil)
                                     (_ '("HEAD~1"))))
           (syringe--untracked-diff root)))
+
+(defun syringe--change-description (kind)
+  "Return a sentence that tells the robot how to see the change of KIND."
+  (pcase kind
+    ('unstaged "The change is my work that is not committed: what the \
+command \"git diff\" prints, run from the root of the repository, together \
+with the new files that git does not track yet; the command \"git ls-files \
+--others --exclude-standard\" lists those.")
+    (_ "The change is the last commit together with my work on top of it \
+that is not committed: what the command \"git diff HEAD~1\" prints, run from \
+the root of the repository, together with the new files that git does not \
+track yet; the command \"git ls-files --others --exclude-standard\" lists \
+those.  The command \"git log -1\" prints the message of the commit; read \
+it too.")))
 
 (defun syringe--current-p ()
   "Return non-nil if the open review is of the commit that is checked out."
@@ -1181,7 +1295,8 @@ conversation windows appear when they are first needed.
 A review belongs to the commit that is checked out.  If the open
 review is this one already, only take its diff again.  If a review
 of this kind and commit is saved, open it, with its conversations.
-Else start a new one.  The review that was open is saved and closed.
+Else start a new one and have the robot read the diff.  The review
+that was open is saved and closed.
 
 The review is saved as you go, and its diff follows the code: see
 `syringe--refresh-diff'."
@@ -1319,6 +1434,8 @@ The newest comes first."
   (when syringe--file
     (let ((data (list :version 1
                       :about syringe--about
+                      :base syringe--base
+                      :base-ready (eq syringe--base-state 'ready)
                       :conversations (mapcar #'syringe--conversation-data
                                              syringe--conversations)))
           (new (concat syringe--file ".new"))
@@ -1335,10 +1452,19 @@ The newest comes first."
 (defun syringe--close-review ()
   "Save the current review, if there is one, and take it off the screen."
   (syringe--save)
-  (let ((conversations syringe--conversations))
+  (let ((conversations syringe--conversations)
+        (process syringe--base-process))
+    ;; Forget the review first, so that what its robots still report
+    ;; when they are stopped is ignored.
     (setq syringe--conversations nil
           syringe--file nil
-          syringe--about nil)
+          syringe--about nil
+          syringe--base nil
+          syringe--base-state nil
+          syringe--base-process nil
+          syringe--base-error nil)
+    (when (process-live-p process)
+      (delete-process process))
     (mapc #'syringe--drop conversations)))
 
 (defun syringe--new-review (root diff kind commit)
@@ -1364,6 +1490,7 @@ is the commit that is checked out, which the review belongs to."
                 :commit commit
                 :head (syringe--git root "log" "-1" "--format=%h %s")))
     (syringe--fill-diff-buffer diff root)
+    (syringe--prepare-base)
     (syringe--save)))
 
 (defun syringe--open-review (file root)
@@ -1377,6 +1504,8 @@ saved; the dots are put where the lines of the conversations are now."
     (setq syringe--file file
           syringe--root root
           syringe--about (plist-get data :about)
+          syringe--base (plist-get data :base)
+          syringe--base-state (and (plist-get data :base-ready) 'ready)
           syringe--conversations (mapcar #'syringe--conversation-from-data
                                          (plist-get data :conversations)))
     (syringe--fill-diff-buffer diff root)
@@ -1386,7 +1515,10 @@ saved; the dots are put where the lines of the conversations are now."
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
         (when (syringe--in-review-p)
-          (syringe--settle-buffer t))))))
+          (syringe--settle-buffer t))))
+    ;; The robot had not finished reading the diff when the review closed.
+    (unless (eq syringe--base-state 'ready)
+      (syringe--prepare-base))))
 
 (defun syringe--review-label (file)
   "Return the line that shows the review saved in FILE in a list.
