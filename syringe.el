@@ -51,6 +51,7 @@
 ;;   syringe-open-conversation  jump to the closest dot, open its conversation
 ;;   syringe-next-dot           jump to the next dot
 ;;   syringe-previous-dot       jump to the previous dot
+;;   syringe-list-dots          choose a dot from a list and jump to it
 ;;   syringe-restore            open a saved review
 ;;
 ;; A review is saved as you go, in the directory syringe inside the
@@ -799,6 +800,84 @@ show for a thing.  The lines are shown in the order of THINGS.  With
                      (complete-with-action action choices string predicate)))
                  nil t)
                 choices))))
+
+(defun syringe--dot-label (conversation)
+  "Return the line that shows CONVERSATION in the list of dots.
+That is its dot, its state unless there is nothing new, its place
+and your first message."
+  (format "%s %-8s %-28s %s"
+          (propertize "●" 'face (syringe--dot-face conversation))
+          ;; In words too: the selected line of a list loses its colors.
+          (cond ((syringe-conversation-lost conversation) "lost")
+                (t (pcase (syringe-conversation-state conversation)
+                     ('unread "unread")
+                     ('thinking "thinking")
+                     ('error "failed")
+                     (_ ""))))
+          (syringe-conversation-title conversation)
+          (truncate-string-to-width
+           (string-replace "\n" " "
+                           (or (cdr (assq 'user (syringe-conversation-messages
+                                                 conversation)))
+                               ""))
+           60 nil nil t)))
+
+(defun syringe--goto-conversation (conversation)
+  "Go to the dot of CONVERSATION and show the conversation next to it.
+From the diff, go to its dot in the diff; from anywhere else, to its
+dot in the live code.  If it has only one dot, go to that one.  If
+it has none, because its line is lost, go to the conversation."
+  ;; A dot in a file that is not open comes back when the file is visited.
+  (let ((file (syringe-conversation-code-file conversation)))
+    (when (and file
+               (not (syringe--live-dot
+                     (syringe-conversation-code-dot conversation)))
+               (file-regular-p (expand-file-name file syringe--root)))
+      (find-file-noselect (expand-file-name file syringe--root))))
+  (let* ((diff-dot (syringe--live-dot
+                    (syringe-conversation-diff-dot conversation)))
+         (code-dot (syringe--live-dot
+                    (syringe-conversation-code-dot conversation)))
+         (dot (if (eq (syringe--window-role (selected-window)) 'diff)
+                  (or diff-dot code-dot)
+                (or code-dot diff-dot)))
+         (buffer (syringe--chat-buffer conversation)))
+    (cond ((null dot))
+          ((eq dot code-dot)
+           (select-window (syringe--show (overlay-buffer dot) 'code)))
+          (t
+           (when-let* ((win (syringe--window 'diff)))
+             (select-window win))
+           (switch-to-buffer (overlay-buffer dot))))
+    (when dot
+      (goto-char (overlay-start dot)))
+    (let ((win (syringe--show buffer 'chat)))
+      (set-window-point win (with-current-buffer buffer (point-max)))
+      (unless dot
+        (select-window win)))
+    (syringe--mark-read conversation)))
+
+(defun syringe-list-dots ()
+  "Choose a dot from a list of all the dots and jump to it.
+The dots with an answer you have not gone to come first, then the
+failed ones, then the ones the robot is thinking about, then the
+rest.  A line shows the dot, its state, its place and your first
+message; type to narrow the list."
+  (interactive)
+  (unless syringe--conversations
+    (user-error "There are no dots yet"))
+  (let* ((order '(unread error thinking read))
+         (rank (lambda (conversation)
+                 (seq-position order
+                               (syringe-conversation-state conversation))))
+         (conversation
+          (syringe--choose "Dot: "
+                           (sort (copy-sequence syringe--conversations)
+                                 (lambda (a b)
+                                   (< (funcall rank a) (funcall rank b))))
+                           #'syringe--dot-label)))
+    (when conversation
+      (syringe--goto-conversation conversation))))
 
 ;;;; Windows
 
