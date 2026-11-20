@@ -179,8 +179,7 @@ on the same line in the live code."
   lost             ; non-nil when the line is not found any more
   told             ; (PLACE . TEXT): what the robot last heard about the line
   (state 'read)    ; `read', `thinking', `unread' or `error': the dot's color
-  activity         ; what the robot is doing while it thinks, a string or nil
-  process)         ; the robot process while it thinks, or nil
+  activity)        ; what the robot is doing while it thinks, a string or nil
 
 (defvar syringe--conversations nil
   "Every conversation, newest first.")
@@ -215,7 +214,8 @@ Every conversation is held in it.")
   "State of `syringe--session': `preparing', `ready', `failed', or nil.")
 
 (defvar syringe--session-process nil
-  "The robot process that reads the diff, while it runs.")
+  "The robot process that is at work in `syringe--session', or nil.
+It reads the diff or works on a message; there is never more than one.")
 
 (defvar syringe--session-error nil
   "Why `syringe--session' failed, a string.")
@@ -618,10 +618,8 @@ line shows it."
     (syringe--save)))
 
 (defun syringe--drop (conversation)
-  "Take CONVERSATION off the screen and stop its robot.
-That is its dots, its buffer and its robot process."
-  (when (process-live-p (syringe-conversation-process conversation))
-    (delete-process (syringe-conversation-process conversation)))
+  "Take CONVERSATION off the screen.
+That is its dots and its buffer."
   (dolist (dot (syringe--live-dots conversation))
     (with-current-buffer (overlay-buffer dot)
       (delete-overlay dot)
@@ -637,6 +635,9 @@ conversation, it still knows."
   ;; First, so that the robot's reply to a killed process is ignored.
   (setq syringe--conversations (delq conversation syringe--conversations)
         syringe--waiting (assq-delete-all conversation syringe--waiting))
+  (when (and (eq conversation syringe--asking)
+             (process-live-p syringe--session-process))
+    (delete-process syringe--session-process))
   (syringe--drop conversation)
   (syringe--ask-next)
   (syringe--save))
@@ -1176,15 +1177,10 @@ The answer arrives in the background."
 
 (defun syringe--start-session ()
   "Start the robot session that reads the diff; see `syringe--session'."
-  (let ((old syringe--session-process)
-        (session (syringe-engine-new-session)))
+  (let ((session (syringe-engine-new-session)))
     (setq syringe--session session
           syringe--session-state 'preparing
           syringe--session-error nil)
-    ;; After the new session is set, so that the end of the old one is
-    ;; ignored below.
-    (when (process-live-p old)
-      (delete-process old))
     (condition-case err
         (setq syringe--session-process
               (syringe-engine-send
@@ -1329,7 +1325,7 @@ message of a conversation that still exists."
           (error "%s" (or syringe--session-error
                           "No review is running; start one with \
 M-x syringe-start")))
-        (setf (syringe-conversation-process conversation)
+        (setq syringe--session-process
               (syringe-engine-send
                syringe--session
                (syringe--prompt conversation text where)
@@ -1355,7 +1351,6 @@ the next message that waits."
   (when (eq conversation syringe--asking)
     (setq syringe--asking nil))
   (when (memq conversation syringe--conversations)
-    (setf (syringe-conversation-process conversation) nil)
     (syringe--say conversation (if ok 'robot 'error) text)
     (cond ((not ok)
            (syringe--set-state conversation 'error))
@@ -1910,8 +1905,8 @@ answered.  Send your message again.")))))
   (syringe--save)
   (let ((conversations syringe--conversations)
         (process syringe--session-process))
-    ;; Forget the review first, so that what its robots still report
-    ;; when they are stopped is ignored.
+    ;; Forget the review first, so that what its robot still reports
+    ;; when it is stopped is ignored.
     (setq syringe--conversations nil
           syringe--file nil
           syringe--about nil
