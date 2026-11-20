@@ -23,6 +23,7 @@
 ;;                              the new files
 ;;   syringe-toggle-dot         put a dot on this line and open its
 ;;                              conversation, or remove the dot that is there
+;;   syringe-open-conversation  jump to the closest dot, open its conversation
 ;;   syringe-next-dot           jump to the next dot
 ;;   syringe-previous-dot       jump to the previous dot
 
@@ -173,6 +174,17 @@ That is its dots and its buffer."
   "Return a name for the current line, such as \"src/main.c:42\"."
   (format "%s:%d" (syringe--file-title) (line-number-at-pos nil t)))
 
+(defun syringe--closest-dot ()
+  "Return the dot the fewest lines away from the current line, or nil."
+  (let ((here (pos-bol))
+        closest distance)
+    (dolist (dot (syringe--dots) closest)
+      (let* ((there (overlay-start dot))
+             (lines (count-lines (min here there) (max here there))))
+        (when (or (null distance) (< lines distance))
+          (setq closest dot
+                distance lines))))))
+
 (defun syringe--add-dot ()
   "Start a conversation about the current line and return it.
 Put a dot on the line."
@@ -209,6 +221,13 @@ conversation has messages."
   (let ((dot (seq-find (lambda (dot) (< (overlay-start dot) (pos-bol)))
                        (reverse (syringe--dots)))))
     (goto-char (overlay-start (or dot (user-error "No dot above this line"))))))
+
+(defun syringe-open-conversation ()
+  "Jump to the dot closest to the current line and open its conversation."
+  (interactive)
+  (let ((dot (or (syringe--closest-dot) (user-error "No dots in this buffer"))))
+    (goto-char (overlay-start dot))
+    (syringe--open-chat (overlay-get dot 'syringe-conversation))))
 
 ;;;; Windows
 
