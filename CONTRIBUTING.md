@@ -9,13 +9,13 @@ repository.
 
     make check
 
-It compiles `syringe.el` with warnings treated as errors and fails if
-Emacs would indent a line differently.  Every commit of a series must
-pass it, not only the last one:
+It compiles `syringe.el` and the tests with warnings treated as errors,
+fails if Emacs would indent a line differently, and runs the tests.
+Every commit of a series must pass it, not only the last one:
 
     git rebase -x 'make check' <base>
 
-There are no automated tests.
+The tests are in `test/syringe-test.el`.
 
 ## Areas
 
@@ -31,7 +31,7 @@ The subject of a commit starts with the part that it changes.  For
     keys      the key bindings at the end of the file
 
 The other files are named by themselves: `build` for the Makefile and
-`tools`, `doc`, `gitignore`.
+`tools`, `test`, `doc`, `gitignore`.
 
 ## Merging
 
