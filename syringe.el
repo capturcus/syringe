@@ -165,6 +165,7 @@ on the same line in the live code."
   diff-number      ; its line number in that file
   lost             ; non-nil when the line is not found any more
   (state 'read)    ; `read', `thinking', `unread' or `error': the dot's color
+  activity         ; what the robot is doing while it thinks, a string or nil
   session          ; the robot session, or nil before the first message
   process)         ; the robot process while it thinks, or nil
 
@@ -567,11 +568,13 @@ It is gray if the line is lost, and else has the color of the state."
                   (syringe--live-dot
                    (syringe-conversation-code-dot conversation)))))
 
-(defun syringe--set-state (conversation state)
+(defun syringe--set-state (conversation state &optional activity)
   "Put CONVERSATION in STATE and show it.
-STATE is `read', `thinking', `unread' or `error'; it colors the dots,
-and the conversation's header line shows it."
-  (setf (syringe-conversation-state conversation) state)
+STATE is `read', `thinking', `unread' or `error'; it colors the dots.
+ACTIVITY says what the robot is doing; the conversation's header
+line shows it."
+  (setf (syringe-conversation-state conversation) state
+        (syringe-conversation-activity conversation) activity)
   (mapc #'syringe--draw-dot (syringe--live-dots conversation))
   (let ((buffer (syringe-conversation-buffer conversation)))
     (when (buffer-live-p buffer)
@@ -870,7 +873,7 @@ Type after the prompt and press RET to send the message."
 
 (defun syringe--chat-header ()
   "Return the header line of a conversation buffer.
-It shows the title and whether the robot is thinking."
+It shows the title and, while the robot thinks, what it is doing."
   (let ((conversation syringe--conversation))
     (when conversation
       ;; A % would be read as a mode line construct.
@@ -878,7 +881,10 @@ It shows the title and whether the robot is thinking."
        "%" "%%"
        (concat " " (syringe-conversation-title conversation)
                (pcase (syringe-conversation-state conversation)
-                 ('thinking "  —  thinking")
+                 ('thinking
+                  (concat "  —  "
+                          (or (syringe-conversation-activity conversation)
+                              "thinking")))
                  ('error "  —  failed")))))))
 
 (defun syringe--leave-windows ()
@@ -1080,10 +1086,13 @@ look at the files as they are now.")))))
   "Send your message TEXT in CONVERSATION to the robot.
 The answer comes later, through `syringe--answer'.  If the robot is
 still reading the diff, the message waits for that."
-  (syringe--set-state conversation 'thinking)
   (if (eq syringe--base-state 'preparing)
-      (push (lambda () (syringe--ask-now conversation text))
-            syringe--base-waiting)
+      (progn
+        (syringe--set-state conversation 'thinking
+                            "waiting for the robot to finish reading the diff")
+        (push (lambda () (syringe--ask-now conversation text))
+              syringe--base-waiting))
+    (syringe--set-state conversation 'thinking)
     (syringe--ask-now conversation text)))
 
 (defun syringe--ask-now (conversation text)
@@ -1105,7 +1114,10 @@ M-x syringe-start-last-commit or M-x syringe-start-unstaged")))
                  (syringe-conversation-session conversation)
                  (syringe--prompt conversation text first where)
                  syringe--root
-                 #'ignore
+                 (lambda (activity)
+                   (when (eq (syringe-conversation-state conversation)
+                             'thinking)
+                     (syringe--set-state conversation 'thinking activity)))
                  (lambda (ok answer)
                    ;; A first message that failed never said what the
                    ;; conversation is about, so start over next time.
