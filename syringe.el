@@ -35,6 +35,7 @@
 ;;   syringe-open-conversation  jump to the closest dot, open its conversation
 ;;   syringe-next-dot           jump to the next dot
 ;;   syringe-previous-dot       jump to the previous dot
+;;   syringe-restore            open a saved review
 ;;
 ;; A review is saved as you go, in the directory syringe inside the
 ;; repository's .git, so it is never committed.
@@ -628,6 +629,31 @@ first when the conversation has messages."
     (goto-char (overlay-start dot))
     (syringe--open-chat (overlay-get dot 'syringe-conversation))))
 
+(defun syringe--choose (prompt things label)
+  "Let the user choose one of THINGS in the minibuffer; return it.
+PROMPT is the prompt.  LABEL is a function that returns the line to
+show for a thing.  The lines are shown in the order of THINGS.  With
+`helm-mode' the list looks like the other Helm lists."
+  (let ((choices nil))
+    (dolist (thing things)
+      (let ((line (funcall label thing))
+            (count 1))
+        ;; Two things may read the same; number the later ones.
+        (while (assoc line choices)
+          (setq line (format "%s (%d)" (funcall label thing) (cl-incf count))))
+        (push (cons line thing) choices)))
+    (setq choices (nreverse choices))
+    (cdr (assoc (completing-read
+                 prompt
+                 (lambda (string predicate action)
+                   (if (eq action 'metadata)
+                       ;; Keep the order instead of sorting by name.
+                       '(metadata (display-sort-function . identity)
+                                  (cycle-sort-function . identity))
+                     (complete-with-action action choices string predicate)))
+                 nil t)
+                choices))))
+
 ;;;; Windows
 
 ;; A window is recognized by what it shows right now, not by where it
@@ -863,18 +889,20 @@ the new file, or in the old file for a removed line."
        (and (= (point) target)
             (list file number kind))))))
 
-;; The next two functions find the line of a conversation in the diff.
+;; The next three functions find the lines of the conversations in the
+;; diff and draw their dots there.
 
-(defun syringe--diff-find (file text number)
+(defun syringe--diff-find (file text removed number)
   "Return the start of the line of the diff that shows line TEXT of FILE.
-That is a line of the file as it is now.  Of several such lines,
-return the one whose line number in the file is nearest to NUMBER.
-Return nil if there is none.  The current buffer is the diff."
+With REMOVED non-nil that is a removed line, and else a line of the
+file as it is now.  Of several such lines, return the one whose line
+number in the file is nearest to NUMBER.  Return nil if there is
+none.  The current buffer is the diff."
   (let (found distance)
     (syringe--each-diff-line
      (lambda (this kind line)
        (when (and (equal this file)
-                  (not (eq kind ?-))
+                  (eq (eq kind ?-) (and removed t))
                   (equal text (buffer-substring-no-properties
                                (1+ (point)) (pos-eol))))
          (let ((far (abs (- line (or number line)))))
@@ -888,13 +916,50 @@ Return nil if there is none.  The current buffer is the diff."
 (defun syringe--diff-position (conversation)
   "Return the position in the diff of the line of CONVERSATION, or nil.
 Return nil if there is no diff, or if the diff does not have the line."
-  (let ((buffer (get-buffer syringe--diff-buffer)))
-    (when (and buffer (syringe-conversation-code-file conversation))
+  (let ((buffer (get-buffer syringe--diff-buffer))
+        (text (syringe-conversation-diff-text conversation)))
+    (when buffer
       (with-current-buffer buffer
-        (syringe--diff-find
-         (syringe-conversation-code-file conversation)
-         (syringe-conversation-code-text conversation)
-         (syringe-conversation-code-line conversation))))))
+        (cond ((syringe-conversation-code-file conversation)
+               ;; A line that is lost in the code has no place here either.
+               (unless (syringe-conversation-lost conversation)
+                 (syringe--diff-find
+                  (syringe-conversation-code-file conversation)
+                  (syringe-conversation-code-text conversation)
+                  nil
+                  (syringe-conversation-code-line conversation))))
+              ;; A line that is only in the diff.
+              ((syringe-conversation-diff-file conversation)
+               (syringe--diff-find
+                (syringe-conversation-diff-file conversation)
+                (substring text 1)
+                (eq (aref text 0) ?-)
+                (syringe-conversation-diff-number conversation)))
+              ;; A line outside the hunks, such as the header of a file.
+              (text
+               (save-excursion
+                 (goto-char (point-min))
+                 (and (re-search-forward (concat "^" (regexp-quote text) "$")
+                                         nil t)
+                      (pos-bol)))))))))
+
+(defun syringe--place-diff-dots ()
+  "Draw the dots of the diff afresh.
+Every conversation gets a dot on the line of the diff that shows its
+line, if the diff has that line.  A conversation about a line that
+is only in the diff is lost when the diff does not have the line."
+  (when-let* ((buffer (get-buffer syringe--diff-buffer)))
+    (with-current-buffer buffer
+      (mapc #'delete-overlay (syringe--dots))
+      (dolist (conversation syringe--conversations)
+        (let ((position (syringe--diff-position conversation)))
+          (setf (syringe-conversation-diff-dot conversation) nil)
+          (when (and (syringe-conversation-diff-text conversation)
+                     (not (syringe-conversation-code-file conversation)))
+            (setf (syringe-conversation-lost conversation) (null position)))
+          (when position
+            (syringe--make-dot conversation buffer position))))
+      (syringe--sync))))
 
 (defun syringe-diff-visit ()
   "Show the live code for the diff line at point in the code window.
@@ -1070,12 +1135,30 @@ See `syringe--start' for what starting a review does."
                     (or (syringe--git root "rev-parse" "--absolute-git-dir")
                         (user-error "No git repository at %s" root))))
 
+(defun syringe--review-files (root)
+  "Return the files of the saved reviews of the repository at ROOT.
+The newest comes first."
+  (let ((directory (syringe--directory root)))
+    (and (file-directory-p directory)
+         ;; The name of a file is the time its review started.
+         (sort (directory-files directory t "\\.eld\\'")
+               (lambda (a b)
+                 (string> (file-name-sans-extension a)
+                          (file-name-sans-extension b)))))))
+
 (defun syringe--diff-file (file)
   "Return the file with the diff of the review saved in FILE."
   (concat (file-name-sans-extension file) ".diff"))
 
 ;; `utf-8-emacs' writes any text that a buffer can hold, also the bytes
 ;; of a file in the diff that is not valid UTF-8, and reads it back the same.
+
+(defun syringe--read-text (file)
+  "Return the contents of FILE as a string."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8-emacs))
+      (insert-file-contents file))
+    (buffer-string)))
 
 (defun syringe--write-text (file text)
   "Write the string TEXT to FILE."
@@ -1103,6 +1186,14 @@ See `syringe--start' for what starting a review does."
            collect (intern (format ":%s" slot))
            collect (cl-struct-slot-value 'syringe-conversation slot
                                          conversation)))
+
+(defun syringe--conversation-from-data (data)
+  "Return the conversation that the property list DATA describes."
+  (let ((conversation (syringe--conversation-create)))
+    (dolist (slot syringe--saved-slots)
+      (setf (cl-struct-slot-value 'syringe-conversation slot conversation)
+            (plist-get data (intern (format ":%s" slot)))))
+    conversation))
 
 (defun syringe--save ()
   "Save the current review, if there is one, to its file."
@@ -1153,6 +1244,63 @@ KIND is the kind of the review, `last-commit' or `unstaged'."
                 :head (syringe--git root "log" "-1" "--format=%h %s")))
     (syringe--fill-diff-buffer diff root)
     (syringe--save)))
+
+(defun syringe--open-review (file root)
+  "Make the review saved in FILE the current one.
+ROOT is the root of its repository.  The diff is shown as it was
+saved; the dots are put where the lines of the conversations are now."
+  ;; Read first: if that fails, the current review stays open.
+  (let ((data (read (syringe--read-text file)))
+        (diff (syringe--read-text (syringe--diff-file file))))
+    (syringe--close-review)
+    (setq syringe--file file
+          syringe--root root
+          syringe--about (plist-get data :about)
+          syringe--conversations (mapcar #'syringe--conversation-from-data
+                                         (plist-get data :conversations)))
+    (syringe--fill-diff-buffer diff root)
+    (syringe--place-diff-dots)
+    ;; The dots in the code come back now in the files that are open,
+    ;; and in the others when they are visited.
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (syringe--in-review-p)
+          (syringe--settle-buffer t))))))
+
+(defun syringe--review-label (file)
+  "Return the line that shows the review saved in FILE in a list.
+That is when it started, what it reviews, the commit that was
+checked out and the number of conversations."
+  (let* ((data (read (syringe--read-text file)))
+         (about (plist-get data :about)))
+    (format "%s  %-11s  %s  %d conversations"
+            (plist-get about :created)
+            (pcase (plist-get about :kind)
+              ('unstaged "unstaged")
+              (_ "last commit"))
+            (truncate-string-to-width (or (plist-get about :head) "")
+                                      50 nil nil t)
+            (length (plist-get data :conversations)))))
+
+(defun syringe-restore (directory)
+  "Open a saved review of the git repository that contains DIRECTORY.
+Choose it from a list, the newest first.  A line shows when the
+review started, what it reviews, the commit that was checked out and
+the number of conversations.  The review that was open is saved and
+closed.
+
+The review shows the diff as it was saved.  The dots go to where
+their lines are now."
+  (interactive (list default-directory))
+  (let* ((root (syringe--repository directory))
+         (file (syringe--choose
+                "Review: "
+                (or (syringe--review-files root)
+                    (user-error "This repository has no saved reviews"))
+                #'syringe--review-label)))
+    (when file
+      (syringe--open-review file root)
+      (syringe--show-diff-buffer))))
 
 (provide 'syringe)
 ;;; syringe.el ends here
