@@ -14,8 +14,14 @@
 ;; line that is both in the diff and in the live code has a dot in both
 ;; places, and the two dots share one conversation.  When point comes
 ;; to a line with a dot, the conversation window shows that
-;; conversation.  A gray dot marks a line that is lost: it was deleted
-;; or rewritten beyond recognition.
+;; conversation.  The color of a dot tells the state of its
+;; conversation:
+;;
+;;   blue    nothing new
+;;   orange  the robot is thinking
+;;   green   the robot has answered and you have not gone there yet
+;;   red     the last message failed
+;;   gray    the line is lost: it was deleted or rewritten beyond recognition
 ;;
 ;; A review is alive.  You edit the code, and so may other programs.
 ;; The diff is taken again whenever a file of the repository is saved
@@ -102,7 +108,16 @@ review, not to the running one."
   :type 'string)
 
 (defface syringe-dot '((t :foreground "DodgerBlue" :weight bold))
-  "Face of a dot in the left margin.")
+  "Face of a dot whose conversation has nothing new.")
+
+(defface syringe-dot-thinking '((t :foreground "orange" :weight bold))
+  "Face of a dot whose conversation the robot is thinking about.")
+
+(defface syringe-dot-unread '((t :foreground "green3" :weight bold))
+  "Face of a dot whose conversation has an answer you have not gone to.")
+
+(defface syringe-dot-error '((t :foreground "red" :weight bold))
+  "Face of a dot whose last message failed.")
 
 (defface syringe-dot-lost '((t :foreground "gray50" :weight bold))
   "Face of a dot whose line is not found in the code any more.")
@@ -149,7 +164,7 @@ on the same line in the live code."
   diff-text        ; the line of the diff, with its first character
   diff-number      ; its line number in that file
   lost             ; non-nil when the line is not found any more
-  (state 'read)    ; `read', `thinking' or `error'
+  (state 'read)    ; `read', `thinking', `unread' or `error': the dot's color
   session          ; the robot session, or nil before the first message
   process)         ; the robot process while it thinks, or nil
 
@@ -528,10 +543,14 @@ That happens when another program has changed the file."
 
 (defun syringe--dot-face (conversation)
   "Return the face of the dots of CONVERSATION.
-It is gray if the line is lost."
+It is gray if the line is lost, and else has the color of the state."
   (if (syringe-conversation-lost conversation)
       'syringe-dot-lost
-    'syringe-dot))
+    (pcase (syringe-conversation-state conversation)
+      ('thinking 'syringe-dot-thinking)
+      ('unread 'syringe-dot-unread)
+      ('error 'syringe-dot-error)
+      (_ 'syringe-dot))))
 
 (defun syringe--draw-dot (dot)
   "Draw DOT in the left margin, in the color of its conversation."
@@ -550,13 +569,20 @@ It is gray if the line is lost."
 
 (defun syringe--set-state (conversation state)
   "Put CONVERSATION in STATE and show it.
-STATE is `read', `thinking' or `error'; the conversation's header
-line shows it."
+STATE is `read', `thinking', `unread' or `error'; it colors the dots,
+and the conversation's header line shows it."
   (setf (syringe-conversation-state conversation) state)
+  (mapc #'syringe--draw-dot (syringe--live-dots conversation))
   (let ((buffer (syringe-conversation-buffer conversation)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (force-mode-line-update)))))
+
+(defun syringe--mark-read (conversation)
+  "Note that you have gone to CONVERSATION: a green dot turns blue."
+  (when (eq (syringe-conversation-state conversation) 'unread)
+    (syringe--set-state conversation 'read)
+    (syringe--save)))
 
 (defun syringe--drop (conversation)
   "Take CONVERSATION off the screen and stop its robot.
@@ -625,7 +651,8 @@ and a conversation window is open."
             (unless (eq buffer (window-buffer win))
               (set-window-buffer win buffer)
               (set-window-point win (with-current-buffer buffer
-                                      (point-max))))))))))
+                                      (point-max))))
+            (syringe--mark-read conversation)))))))
 
 (defun syringe--remember-diff-line (conversation)
   "Remember the line of the diff at point as the line of CONVERSATION.
@@ -830,7 +857,16 @@ With SELECT non-nil, go to that window too."
 Type after the prompt and press RET to send the message."
   (setq-local word-wrap t)
   (setq-local truncate-lines nil)
-  (add-hook 'kill-buffer-hook #'syringe--leave-windows nil t))
+  (add-hook 'kill-buffer-hook #'syringe--leave-windows nil t)
+  (add-hook 'window-selection-change-functions #'syringe--chat-selected nil t))
+
+(defun syringe--chat-selected (window)
+  "Mark the conversation in WINDOW as read when WINDOW becomes selected."
+  (when (eq window (selected-window))
+    (let ((conversation (buffer-local-value 'syringe--conversation
+                                            (window-buffer window))))
+      (when conversation
+        (syringe--mark-read conversation)))))
 
 (defun syringe--chat-header ()
   "Return the header line of a conversation buffer.
@@ -934,7 +970,8 @@ The answer arrives in the background."
 (defun syringe--open-chat (conversation)
   "Show CONVERSATION in the conversation window and go there."
   (select-window (syringe--show (syringe--chat-buffer conversation) 'chat))
-  (goto-char (point-max)))
+  (goto-char (point-max))
+  (syringe--mark-read conversation))
 
 ;;;; Talking to the robot
 
@@ -1084,7 +1121,15 @@ otherwise the reason it failed."
   (when (memq conversation syringe--conversations)
     (setf (syringe-conversation-process conversation) nil)
     (syringe--say conversation (if ok 'robot 'error) text)
-    (syringe--set-state conversation (if ok 'read 'error))
+    (cond ((not ok)
+           (syringe--set-state conversation 'error))
+          ;; You are in the conversation right now.
+          ((eq (window-buffer) (syringe-conversation-buffer conversation))
+           (syringe--set-state conversation 'read))
+          (t
+           (syringe--set-state conversation 'unread)
+           (message "Syringe: the robot answered in %s"
+                    (syringe-conversation-title conversation))))
     (syringe--save)))
 
 ;;;; The diff
