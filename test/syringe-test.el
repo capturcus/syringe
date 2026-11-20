@@ -311,7 +311,7 @@ With FAILED non-nil the robot fails instead, and TEXT says why."
 
 (defun syringe-test-start ()
   "Start a review of the last commit and let the robot read the change."
-  (syringe-start-last-commit syringe-test-root)
+  (syringe-start syringe-test-root)
   (syringe-test-answer "ready"))
 
 (defun syringe-test-diff ()
@@ -334,7 +334,7 @@ With FAILED non-nil the robot fails instead, and TEXT says why."
     (syringe-test-write "notes.txt" "not committed\n" t)
     (syringe-test-write "fresh.txt" "a new file\n")
     (syringe-test-write "build.log" "a file that git ignores\n")
-    (syringe-start-last-commit syringe-test-root)
+    (syringe-start syringe-test-root)
     (should (equal (buffer-name) syringe--diff-buffer))
     (should (derived-mode-p 'syringe-diff-mode))
     (should buffer-read-only)
@@ -857,12 +857,12 @@ the choice has.  Return the choices that were offered, in order."
     (syringe-test-dot 30)
     (let ((file syringe--file))
       ;; While the review is open:
-      (syringe-start-last-commit syringe-test-root)
+      (syringe-start syringe-test-root)
       (should (equal syringe--file file))
       (should (= (length syringe--conversations) 1))
       ;; And after it was closed:
       (syringe--close-review)
-      (syringe-start-last-commit syringe-test-root)
+      (syringe-start syringe-test-root)
       (should (equal syringe--file file))
       (should (= (length syringe--conversations) 1))
       (should (equal (syringe-test-dots (syringe-test-main)) '(30)))
@@ -874,7 +874,7 @@ the choice has.  Return the choices that were offered, in order."
       (should-not (equal syringe--file file))
       (should (eq (plist-get syringe--about :kind) 'unstaged))
       (should-not syringe--conversations)
-      (syringe-start-last-commit syringe-test-root)
+      (syringe-start syringe-test-root)
       (should (equal syringe--file file))
       (should (= (length syringe--conversations) 1)))))
 
@@ -947,7 +947,7 @@ the choice has.  Return the choices that were offered, in order."
 (ert-deftest syringe-test-robot-reads-change ()
   "When a review starts, one robot session is told to read the change."
   (syringe-test-with-repository
-    (syringe-start-last-commit syringe-test-root)
+    (syringe-start syringe-test-root)
     (should (= (length syringe-test-sent) 1))
     (should (equal (caar syringe-test-sent) syringe--base))
     (should (string-search "\"git diff HEAD~1\"" (syringe-test-prompt)))
@@ -1051,7 +1051,7 @@ the choice has.  Return the choices that were offered, in order."
 (ert-deftest syringe-test-message-waits ()
   "A message that is sent while the robot reads the change waits for that."
   (syringe-test-with-repository
-    (syringe-start-last-commit syringe-test-root)
+    (syringe-start syringe-test-root)
     (let ((conversation (syringe-test-dot 30)))
       (syringe-test-say "why?")
       ;; Only the reading of the change is on its way.
@@ -1065,7 +1065,7 @@ the choice has.  Return the choices that were offered, in order."
 (ert-deftest syringe-test-robot-cannot-read-change ()
   "If the robot could not read the change, a message fails and says why."
   (syringe-test-with-repository
-    (syringe-start-last-commit syringe-test-root)
+    (syringe-start syringe-test-root)
     (syringe-test-answer "no network" t)
     (should (equal (syringe--base-indicator) " [robot: failed]"))
     (let ((conversation (syringe-test-dot 30)))
@@ -1191,7 +1191,7 @@ code: it was deleted or rewritten.")))
       ;; What the stopped robot still says is ignored.
       (funcall answer-late t "too late")
       (should-not syringe--conversations)
-      (syringe-start-last-commit syringe-test-root)
+      (syringe-start syringe-test-root)
       (let ((conversation (car syringe--conversations)))
         (should (eq (syringe-conversation-state conversation) 'error))
         (should (equal (mapcar #'car

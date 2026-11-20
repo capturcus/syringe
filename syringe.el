@@ -45,7 +45,7 @@
 ;;
 ;; Commands.  None of them is bound to a key; bind them in your init file.
 ;;
-;;   syringe-start-last-commit  start a review of the last commit and of
+;;   syringe-start              start a review of the last commit and of
 ;;                              the work on top of it that is not committed
 ;;   syringe-start-unstaged     start a review of the unstaged changes and
 ;;                              the new files
@@ -1339,7 +1339,7 @@ still reading the diff, the message waits for that."
             (unless (eq syringe--base-state 'ready)
               (error "%s" (or syringe--base-error
                               "No review is running; start one with \
-M-x syringe-start-last-commit or M-x syringe-start-unstaged")))
+M-x syringe-start or M-x syringe-start-unstaged")))
             (setf (syringe-conversation-session conversation)
                   (syringe-engine-fork syringe--base)))
           (setf (syringe-conversation-process conversation)
@@ -1774,7 +1774,7 @@ of it change nothing"))))
     (syringe--show-diff-buffer)))
 
 ;;;###autoload
-(defun syringe-start-last-commit (directory)
+(defun syringe-start (directory)
   "Start a review of the last commit in the repository of DIRECTORY.
 The diff shows what the commit you have checked out changed, and on
 top of that your work that is not committed, with the new files that
