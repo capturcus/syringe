@@ -12,6 +12,7 @@
 
 (require 'cl-lib)
 (require 'ert)
+(require 'ert-x)
 (require 'syringe)
 
 ;;;; Finding a line again
@@ -1170,6 +1171,149 @@ code: it was deleted or rewritten.")))
                        '(user error)))
         ;; The robot may never have heard of the conversation.
         (should-not (syringe-conversation-session conversation))))))
+
+;;;; The engine
+
+;; These tests run the real functions of the engine, with a shell
+;; script in the place of Copilot and a scratch directory in the place
+;; of the one where Copilot keeps its sessions.
+
+(defun syringe-test-run-engine (script)
+  "Send a prompt with `syringe-engine-send' to SCRIPT in place of Copilot.
+SCRIPT is the text of a shell script.  Wait until it has ended and
+return (ARGUMENTS ACTIVITIES OK TEXT): the arguments it was run
+with, what `syringe-engine-send' reported as activity, and what it
+reported at the end.  The script runs in a scratch directory, which
+it can name as $PWD."
+  (ert-with-temp-directory directory
+    (let* ((syringe-copilot-program (expand-file-name "copilot" directory))
+           (arguments (expand-file-name "arguments" directory))
+           (activities nil)
+           (result nil))
+      (write-region (concat "#!/bin/sh\n"
+                            "printf '%s\\n' \"$@\" > arguments\n"
+                            script)
+                    nil syringe-copilot-program nil 'silent)
+      (set-file-modes syringe-copilot-program #o700)
+      (let ((process (syringe-engine-send
+                      "the-session" "the prompt" directory
+                      (lambda (activity) (push activity activities))
+                      (lambda (ok text) (setq result (list ok text))))))
+        (with-timeout (30 (error "The script has not ended"))
+          (while (not result)
+            (accept-process-output process 0.1))))
+      (cons (split-string (with-temp-buffer
+                            (insert-file-contents arguments)
+                            (buffer-string))
+                          "\n" t)
+            (cons (nreverse activities) result)))))
+
+(ert-deftest syringe-test-engine-send ()
+  "The engine runs Copilot read-only and takes its last message as the answer."
+  (skip-unless (executable-find "sh"))
+  (pcase-let ((`(,arguments ,activities ,ok ,text)
+               (syringe-test-run-engine "cat <<END
+{\"type\":\"tool.execution_start\",\"data\":{\"toolName\":\"view\",\
+\"arguments\":{\"path\":\"$PWD/src/main.rs\"}}}
+{\"type\":\"assistant.message\",\"data\":{\"content\":\"Let me look.\"}}
+{\"type\":\"tool.execution_start\",\"data\":{\"toolName\":\"shell\",\
+\"arguments\":{\"command\":\"git log -1\"}}}
+{\"type\":\"assistant.message\",\"data\":{\"content\":\"\"}}
+{\"type\":\"assistant.message\",\"data\":{\"content\":\"The answer.\\\\n\"}}
+END
+")))
+    (should ok)
+    (should (equal text "The answer."))
+    (should (equal activities '("view src/main.rs" "shell git log -1")))
+    ;; The session and the prompt are passed on, and the robot may not
+    ;; write.
+    (should (equal (cadr (member "--session-id" arguments)) "the-session"))
+    (should (equal (cadr (member "-p" arguments)) "the prompt"))
+    (should (member "--deny-tool=write" arguments))))
+
+(ert-deftest syringe-test-engine-fails ()
+  "The engine reports why Copilot failed, or that it gave no answer."
+  (skip-unless (executable-find "sh"))
+  (pcase-dolist (`(,script . ,why)
+                 '(("echo 'Error: not logged in'\nexit 1\n"
+                    . "Error: not logged in")
+                   ;; It worked, by its exit status, but said nothing.
+                   ("exit 0\n" . "Copilot gave no answer")))
+    (pcase-let ((`(,_arguments ,_activities ,ok ,text)
+                 (syringe-test-run-engine script)))
+      (should-not ok)
+      (should (equal text why))))
+  ;; A program that is not there is an error at once.
+  (let ((syringe-copilot-program "syringe-test-no-such-program"))
+    (should-error (syringe-engine-send "the-session" "the prompt"
+                                       temporary-file-directory
+                                       #'ignore #'ignore))))
+
+(ert-deftest syringe-test-engine-sessions ()
+  "A new session has a name of its own, in the form of a UUID."
+  (let ((sessions (cl-loop repeat 200 collect (syringe-engine-new-session))))
+    (dolist (session sessions)
+      (should (string-match-p
+               (rx bos (= 8 hex) "-" (= 4 hex) "-4" (= 3 hex) "-"
+                   (any "89ab") (= 3 hex) "-" (= 12 hex) eos)
+               session)))
+    (should (= (length (delete-dups sessions)) 200))))
+
+(ert-deftest syringe-test-engine-fork ()
+  "A fork is a copy of the files of a session under a new name."
+  (ert-with-temp-directory home
+    (let* ((process-environment
+            (cons (concat "COPILOT_HOME=" home) process-environment))
+           (session "11111111-2222-4333-8444-555555555555")
+           (read (lambda (session file)
+                   (with-temp-buffer
+                     (insert-file-contents
+                      (expand-file-name
+                       (file-name-concat "session-state" session file)
+                       home))
+                     (buffer-string))))
+           (files `(("workspace.yaml" . ,(format "id: %s\ncwd: /repo\n"
+                                                 session))
+                    ("events.jsonl" . ,(format "{\"sessionId\":\"%s\"}\n\
+{\"parent\":\"%s\"}\n"
+                                               session session))
+                    ("other.txt" . "kept as it is\n"))))
+      (make-directory (file-name-concat home "session-state" session) t)
+      (pcase-dolist (`(,file . ,text) files)
+        (write-region text nil
+                      (file-name-concat home "session-state" session file)
+                      nil 'silent))
+      (let ((fork (syringe-engine-fork session)))
+        (should-not (equal fork session))
+        (pcase-dolist (`(,file . ,text) files)
+          ;; The fork goes by its own name wherever the session is named.
+          (should (equal (funcall read fork file)
+                         (string-replace session fork text)))
+          ;; The session it was copied from is as it was.
+          (should (equal (funcall read session file) text)))))))
+
+(ert-deftest syringe-test-engine-activity ()
+  "What the robot is doing is told in a few words, on one line."
+  (pcase-dolist
+      (`(,data . ,activity)
+       '((((toolName . "view") (arguments (path . "/repo/src/main.rs")))
+          . "view src/main.rs")
+         ;; A title is better than a name.
+         (((toolTitle . "Read") (toolName . "view")
+           (arguments (path . "/repo/notes.txt")))
+          . "Read notes.txt")
+         (((toolName . "shell") (arguments (command . "git log\n  -1")))
+          . "shell git log   -1")
+         (((toolName . "grep") (arguments (pattern . "fn main")))
+          . "grep fn main")
+         (((toolName . "think")) . "think")))
+    (should (equal (syringe-copilot--activity data "/repo/") activity)))
+  ;; A long command is cut short.
+  (should (<= (length (syringe-copilot--activity
+                       `((toolName . "shell")
+                         (arguments (command . ,(make-string 200 ?x))))
+                       "/repo/"))
+              70)))
 
 (provide 'syringe-test)
 ;;; syringe-test.el ends here
