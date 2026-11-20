@@ -17,9 +17,11 @@
 ;; conversation.  A gray dot marks a line that is lost: it was deleted
 ;; or rewritten beyond recognition.
 ;;
-;; A dot follows its line: a conversation remembers the text of its
-;; line and of the lines around it, and looks for the line again when
-;; the code changes.
+;; A review is alive.  You edit the code, and so may other programs.
+;; The diff is taken again whenever a file of the repository is saved
+;; or read again from disk, and the conversations stay.  A dot follows
+;; its line: a conversation remembers the text of its line and of the
+;; lines around it, and looks for the line again when the code changes.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -109,8 +111,14 @@ on the same line in the live code."
 (defvar syringe--about nil
   "Facts about the current review, a property list.
 :created is when it started and :kind what it reviews, `last-commit'
-or `unstaged'.  :head is the short name and subject of the commit
-that was checked out.")
+or `unstaged'.  :commit is the commit the review belongs to and :head
+its short name and subject.")
+
+(defvar syringe--refresh-timer nil
+  "The timer that takes the diff again once Emacs is idle, or nil.")
+
+(defconst syringe--refresh-delay 0.5
+  "How long Emacs must be idle before the diff is taken again, in seconds.")
 
 (defvar syringe--root nil
   "Root directory of the repository under review.")
@@ -429,15 +437,17 @@ file.  Then no dot is where it belongs, and every line is looked for."
 
 (defun syringe--file-saved ()
   "Follow the saving of the current buffer, if its file is in the review.
-Its dots are settled."
+Its dots are settled and the diff is taken again."
   (when (syringe--in-review-p)
-    (syringe--settle-buffer)))
+    (syringe--settle-buffer)
+    (syringe--refresh-soon)))
 
 (defun syringe--file-reloaded ()
   "Follow the reading of the current buffer from its file again.
 That happens when another program has changed the file."
   (when (syringe--in-review-p)
-    (syringe--settle-buffer t)))
+    (syringe--settle-buffer t)
+    (syringe--refresh-soon)))
 
 (defun syringe--file-visited ()
   "Give the current buffer, whose file was just visited, its dots."
@@ -986,7 +996,10 @@ has been edited."
   "Major mode for the diff under review.
 RET goes to the live code for the line at point."
   (setq buffer-read-only t
-        diff-mode-read-only t))
+        diff-mode-read-only t)
+  ;; `g' takes the diff of the review again.
+  (setq-local revert-buffer-function
+              (lambda (&rest _) (syringe--refresh-by-hand))))
 
 (defun syringe--git (root &rest args)
   "Run git with ARGS in ROOT.
@@ -1079,15 +1092,80 @@ diff, as `git log' prints it."
                                     (_ '("HEAD~1"))))
           (syringe--untracked-diff root)))
 
+(defun syringe--current-p ()
+  "Return non-nil if the open review is of the commit that is checked out."
+  (and syringe--file
+       (equal (plist-get syringe--about :commit)
+              (syringe--git syringe--root "rev-parse" "HEAD"))))
+
+(defun syringe--refresh-diff ()
+  "Take the diff of the open review again and show it.
+The conversations stay: their dots are drawn again in the new diff.
+Do nothing if the diff has not changed."
+  (when (and syringe--file (get-buffer syringe--diff-buffer))
+    (let ((diff (syringe--change-diff syringe--root
+                                      (plist-get syringe--about :kind))))
+      (with-current-buffer syringe--diff-buffer
+        (unless (equal diff (save-restriction
+                              (widen)
+                              (buffer-substring-no-properties
+                               (point-min) (point-max))))
+          ;; Keep the buffer and every window that shows it on the line
+          ;; they were on.
+          (let ((line (line-number-at-pos nil t))
+                (places
+                 (mapcar (lambda (win)
+                           (list win
+                                 (line-number-at-pos (window-point win) t)
+                                 (line-number-at-pos (window-start win) t)))
+                         (get-buffer-window-list nil nil t))))
+            (syringe--fill-diff-buffer diff syringe--root)
+            (goto-char (syringe--line-start (1- line)))
+            (pcase-dolist (`(,win ,point ,start) places)
+              (set-window-point win (syringe--line-start (1- point)))
+              (set-window-start win (syringe--line-start (1- start)))))
+          (syringe--place-diff-dots)
+          (syringe--write-text (syringe--diff-file syringe--file) diff)
+          (syringe--save))))))
+
+(defun syringe--refresh-if-current ()
+  "Take the diff again if the review is of the commit that is checked out.
+After a `git checkout' of another commit the review keeps its diff:
+that commit has a review of its own."
+  (with-demoted-errors "Syringe: %S"
+    (when (syringe--current-p)
+      (syringe--refresh-diff))))
+
+(defun syringe--refresh-soon ()
+  "Take the diff again once Emacs is idle.
+Several files that change at once then cost one diff."
+  (when (timerp syringe--refresh-timer)
+    (cancel-timer syringe--refresh-timer))
+  (setq syringe--refresh-timer
+        (run-with-idle-timer syringe--refresh-delay nil
+                             #'syringe--refresh-if-current)))
+
+(defun syringe--refresh-by-hand ()
+  "Take the diff of the open review again, because you asked for it.
+A review of another commit than the one that is checked out keeps
+its diff."
+  (unless syringe--file
+    (user-error "No review is open"))
+  (unless (syringe--current-p)
+    (user-error "This review is of another commit than the one checked out"))
+  (syringe--refresh-diff))
+
 (defun syringe--start (directory kind)
   "Start a review of KIND in the repository that contains DIRECTORY.
 KIND is `last-commit' or `unstaged'.  Show the diff in the selected
 window, or in the window that already shows a diff.  The code and
 conversation windows appear when they are first needed.
 
-The review is saved as you go.  The review that was open is saved and
+The review is saved as you go, and its diff follows the code: see
+`syringe--refresh-diff'.  The review that was open is saved and
 closed."
   (let* ((root (syringe--repository directory))
+         (commit (syringe--git root "rev-parse" "HEAD"))
          (diff (syringe--change-diff root kind)))
     (when (string-empty-p diff)
       (user-error
@@ -1096,16 +1174,16 @@ closed."
           "Nothing to review: no unstaged changes and no new files")
          (_ "Nothing to review: the last commit and the work on top \
 of it change nothing"))))
-    (syringe--new-review root diff kind)
+    (syringe--new-review root diff kind commit)
     (syringe--show-diff-buffer)))
 
 (defun syringe-start-last-commit (directory)
   "Start a review of the last commit in the repository of DIRECTORY.
 The diff shows what the commit you have checked out changed, and on
 top of that your work that is not committed, with the new files that
-git does not track.  It is what `git diff HEAD~1' prints.  To review
-the commits of a branch one by one, check out each in turn and run
-this.
+git does not track.  It is what `git diff HEAD~1' prints, and it is
+taken again whenever a file changes.  To review the commits of a
+branch one by one, check out each in turn and run this.
 
 See `syringe--start' for what starting a review does."
   (interactive (list (syringe--read-directory)))
@@ -1115,7 +1193,8 @@ See `syringe--start' for what starting a review does."
   "Start a review of the uncommitted work in the repository of DIRECTORY.
 The diff shows the unstaged changes, as `git diff' prints them, and
 every new file that git does not track yet, shown as added.  Files
-that git ignores are left out, and so is what you have staged.
+that git ignores are left out, and so is what you have staged.  The
+diff is taken again whenever a file changes.
 
 See `syringe--start' for what starting a review does."
   (interactive (list (syringe--read-directory)))
@@ -1125,9 +1204,8 @@ See `syringe--start' for what starting a review does."
 
 ;; A review is two files in the directory syringe inside the
 ;; repository's .git: NAME.eld holds the conversations as Lisp data,
-;; and NAME.diff the diff as it was when the review started.  NAME is
-;; the time the review started.  The files are written after every
-;; change.
+;; and NAME.diff the diff as it was last shown.  NAME is the time the
+;; review started.  The files are written after every change.
 
 (defun syringe--directory (root)
   "Return the directory with the saved reviews of the repository at ROOT."
@@ -1222,9 +1300,10 @@ The newest comes first."
           syringe--about nil)
     (mapc #'syringe--drop conversations)))
 
-(defun syringe--new-review (root diff kind)
+(defun syringe--new-review (root diff kind commit)
   "Start a review of DIFF, a diff of the repository at ROOT.
-KIND is the kind of the review, `last-commit' or `unstaged'."
+KIND is the kind of the review, `last-commit' or `unstaged'.  COMMIT
+is the commit that is checked out, which the review belongs to."
   (syringe--close-review)
   (let* ((directory (syringe--directory root))
          (name (format-time-string "%Y%m%d-%H%M%S"))
@@ -1241,6 +1320,7 @@ KIND is the kind of the review, `last-commit' or `unstaged'."
           syringe--about
           (list :created (format-time-string "%F %R")
                 :kind kind
+                :commit commit
                 :head (syringe--git root "log" "-1" "--format=%h %s")))
     (syringe--fill-diff-buffer diff root)
     (syringe--save)))
@@ -1289,8 +1369,9 @@ review started, what it reviews, the commit that was checked out and
 the number of conversations.  The review that was open is saved and
 closed.
 
-The review shows the diff as it was saved.  The dots go to where
-their lines are now."
+The review shows the diff as it was saved.  If the commit it belongs
+to is checked out, the diff is then taken again; if not, it stays.
+The dots go to where their lines are now."
   (interactive (list default-directory))
   (let* ((root (syringe--repository directory))
          (file (syringe--choose
@@ -1300,7 +1381,8 @@ their lines are now."
                 #'syringe--review-label)))
     (when file
       (syringe--open-review file root)
-      (syringe--show-diff-buffer))))
+      (syringe--show-diff-buffer)
+      (syringe--refresh-soon))))
 
 (provide 'syringe)
 ;;; syringe.el ends here
