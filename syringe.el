@@ -10,9 +10,11 @@
 ;;   live code     the real files, to read around in and to edit
 ;;   conversation  what you write about one line
 ;;
-;; A dot in the left margin marks a line that has a conversation.
-;; When point comes to a line with a dot, the conversation window shows
-;; that conversation.
+;; A dot in the left margin marks a line that has a conversation.  A
+;; line that is both in the diff and in the live code has a dot in both
+;; places, and the two dots share one conversation.  When point comes
+;; to a line with a dot, the conversation window shows that
+;; conversation.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -64,15 +66,24 @@ When nil, the code window shows the place but the cursor stays in the diff."
 (cl-defstruct (syringe-conversation
                (:constructor syringe--conversation-create)
                (:copier nil))
-  "A conversation about one line, which a dot marks."
+  "A conversation about one line.
+It is marked by up to two dots: one on the line in the diff and one
+on the same line in the live code."
   title            ; where the line is, a string such as "src/main.rs:42"
   messages         ; (ROLE . TEXT) pairs, oldest first; see `syringe--say'
   buffer           ; the buffer that shows the conversation, or nil
   diff-dot         ; the dot in the diff, or nil
-  code-dot)        ; the dot in the live code, or nil
+  code-dot         ; the dot in the live code, or nil
+  ;; The line in the code, to find the same line in the diff.
+  code-file        ; its file, relative to the root, or nil
+  code-line        ; its line number
+  code-text)       ; its text
 
 (defvar syringe--conversations nil
   "Every conversation, newest first.")
+
+(defvar syringe--root nil
+  "Root directory of the repository under review.")
 
 (defconst syringe--diff-buffer "*syringe-diff*"
   "Name of the buffer that shows the diff under review.")
@@ -141,6 +152,39 @@ Do nothing if that line already has a dot."
           (syringe--draw-dot dot)
           (syringe--sync))))))
 
+(defun syringe--lines ()
+  "Return the lines of the current buffer as a vector of strings."
+  (save-restriction
+    (widen)
+    (vconcat (split-string (buffer-substring-no-properties
+                            (point-min) (point-max))
+                           "\n"))))
+
+(defun syringe--line-start (index)
+  "Return the position where line INDEX of the current buffer starts.
+The first line is line 0."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char (point-min))
+      (forward-line index)
+      (point))))
+
+(defun syringe--in-review-p ()
+  "Return non-nil if the current buffer visits a file of the open review."
+  (and syringe--root
+       buffer-file-name
+       (file-in-directory-p buffer-file-name syringe--root)))
+
+(defun syringe--remember-code-line (conversation lines index)
+  "Remember line INDEX of LINES as the line of CONVERSATION.
+LINES are the lines of the current buffer, which visits a file of
+the review."
+  (setf (syringe-conversation-code-file conversation)
+        (file-relative-name buffer-file-name syringe--root)
+        (syringe-conversation-code-line conversation) (1+ index)
+        (syringe-conversation-code-text conversation) (aref lines index)))
+
 (defun syringe--draw-dot (dot)
   "Draw DOT in the left margin."
   (overlay-put dot 'before-string
@@ -180,7 +224,16 @@ That is its dots and its buffer."
 
 (defun syringe--line-title ()
   "Return a name for the current line, such as \"src/main.c:42\"."
-  (format "%s:%d" (syringe--file-title) (line-number-at-pos nil t)))
+  (if (derived-mode-p 'diff-mode)
+      (pcase (syringe--diff-line-info)
+        (`(,file ,line ?-) (format "%s:%d (removed)" file line))
+        (`(,file ,line ,_) (format "%s:%d" file line))
+        ;; A line of the diff that is not part of a hunk: a line of the
+        ;; commit message, which is above the first file, or a header.
+        (_ (if (save-excursion (re-search-backward "^diff --git " nil t))
+               (format "diff line %d" (line-number-at-pos nil t))
+             "the commit message")))
+    (format "%s:%d" (syringe--file-title) (line-number-at-pos nil t))))
 
 (defun syringe--closest-dot ()
   "Return the dot the fewest lines away from the current line, or nil."
@@ -211,21 +264,50 @@ and a conversation window is open."
               (set-window-point win (with-current-buffer buffer
                                       (point-max))))))))))
 
+(defun syringe--add-code-dot (conversation)
+  "Give CONVERSATION, started on the line of the diff at point, a code dot.
+Return non-nil if that worked: the line is an added or unchanged
+line, and its file has it where the diff says.  This visits the file."
+  (pcase (syringe--diff-line-info)
+    (`(,file ,number ,(or ?\s ?+))
+     (let ((path (expand-file-name file syringe--root))
+           (text (buffer-substring-no-properties (1+ (pos-bol)) (pos-eol))))
+       (when (file-regular-p path)
+         (with-current-buffer (find-file-noselect path)
+           (let ((lines (syringe--lines)))
+             (when (and (<= number (length lines))
+                        (equal text (aref lines (1- number))))
+               (syringe--remember-code-line conversation lines (1- number))
+               (syringe--make-dot conversation (current-buffer)
+                                  (syringe--line-start (1- number)))
+               t))))))))
+
 (defun syringe--add-dot ()
   "Start a conversation about the current line and return it.
-Put a dot on the line."
+Put a dot on the line.  If the line is in the diff and in the live
+code, put a dot in both places."
   (let ((conversation (syringe--conversation-create
                        :title (syringe--line-title))))
     (push conversation syringe--conversations)
     (syringe--make-dot conversation (current-buffer) (point))
+    (cond ((derived-mode-p 'syringe-diff-mode)
+           (syringe--add-code-dot conversation))
+          ((syringe--in-review-p)
+           (syringe--remember-code-line conversation (syringe--lines)
+                                        (1- (line-number-at-pos nil t)))
+           (when-let* ((position (syringe--diff-position conversation)))
+             (syringe--make-dot conversation (get-buffer syringe--diff-buffer)
+                                position))))
     conversation))
 
 (defun syringe-toggle-dot ()
   "Put a dot on the current line, or remove the dot that is on it.
-A new dot starts a conversation and opens it.
+A new dot starts a conversation and opens it.  If the line is both
+in the diff and in the live code, it gets a dot in both places, with
+the same conversation.
 
-Removing a dot removes its conversation; this asks first when the
-conversation has messages."
+Removing a dot removes its twin and their conversation; this asks
+first when the conversation has messages."
   (interactive)
   (let ((conversation (syringe--conversation-at-line)))
     (cond ((null conversation)
@@ -436,6 +518,92 @@ ROLE is `user'; nobody else writes yet."
 
 ;;;; The diff
 
+(defun syringe--each-diff-line (function)
+  "Call FUNCTION on the lines of the hunks of the diff, from the top.
+The current buffer is the diff.  FUNCTION is called with point at the
+start of a line and with three arguments: the file that the hunk is
+about, the first character of the line, and the number of the line
+in that file.  The character is a space for an unchanged line, `+'
+for an added one and `-' for a removed one; a removed line is
+numbered as in the old file, the others as in the new file.  Stop
+when FUNCTION returns non-nil, and return that value."
+  (save-excursion
+    (goto-char (point-min))
+    (let (file old new result)
+      (while (not (or result (eobp)))
+        (cond
+         ;; The two lines that name the file of the hunks that follow.
+         ((looking-at "--- \\(?:a/\\)?\\(.*\\)\n\\+\\+\\+ \\(?:b/\\)?\\(.*\\)$")
+          ;; A deleted file has no new name.
+          (setq file (if (equal (match-string 2) "/dev/null")
+                         (match-string-no-properties 1)
+                       (match-string-no-properties 2))
+                old nil)
+          (forward-line 1))
+         ;; The header of a hunk gives the first line number on each side.
+         ((looking-at "@@ -\\([0-9]+\\)\\(?:,[0-9]+\\)? \\+\\([0-9]+\\)")
+          (setq old (string-to-number (match-string 1))
+                new (string-to-number (match-string 2))))
+         ;; A line of a hunk.
+         ((and old (memq (char-after) '(?\s ?+ ?-)))
+          (let ((kind (char-after)))
+            (setq result (funcall function file kind
+                                  (if (eq kind ?-) old new)))
+            (unless (eq kind ?-)
+              (setq new (1+ new)))
+            (unless (eq kind ?+)
+              (setq old (1+ old)))))
+         ;; Anything else, but for the note about a missing last
+         ;; newline, ends the hunk.
+         ((and old (not (eq (char-after) ?\\)))
+          (setq old nil)))
+        (forward-line 1))
+      result)))
+
+(defun syringe--diff-line-info ()
+  "Return (FILE LINE KIND) for the diff line at point, or nil outside a hunk.
+KIND is the first character of the line: a space for an unchanged
+line, `+' for an added one, `-' for a removed one.  LINE counts in
+the new file, or in the old file for a removed line."
+  (let ((target (pos-bol)))
+    (syringe--each-diff-line
+     (lambda (file kind number)
+       (and (= (point) target)
+            (list file number kind))))))
+
+;; The next two functions find the line of a conversation in the diff.
+
+(defun syringe--diff-find (file text number)
+  "Return the start of the line of the diff that shows line TEXT of FILE.
+That is a line of the file as it is now.  Of several such lines,
+return the one whose line number in the file is nearest to NUMBER.
+Return nil if there is none.  The current buffer is the diff."
+  (let (found distance)
+    (syringe--each-diff-line
+     (lambda (this kind line)
+       (when (and (equal this file)
+                  (not (eq kind ?-))
+                  (equal text (buffer-substring-no-properties
+                               (1+ (point)) (pos-eol))))
+         (let ((far (abs (- line (or number line)))))
+           (when (or (null distance) (< far distance))
+             (setq found (point)
+                   distance far))))
+       ;; Go on to the end: a later line may be nearer.
+       nil))
+    found))
+
+(defun syringe--diff-position (conversation)
+  "Return the position in the diff of the line of CONVERSATION, or nil.
+Return nil if there is no diff, or if the diff does not have the line."
+  (let ((buffer (get-buffer syringe--diff-buffer)))
+    (when (and buffer (syringe-conversation-code-file conversation))
+      (with-current-buffer buffer
+        (syringe--diff-find
+         (syringe-conversation-code-file conversation)
+         (syringe-conversation-code-text conversation)
+         (syringe-conversation-code-line conversation))))))
+
 (defun syringe-diff-visit ()
   "Show the live code for the diff line at point in the code window.
 The line is found by its text, so this still works after the file
@@ -603,6 +771,7 @@ See `syringe--start' for what starting a review does."
 (defun syringe--new-review (root diff)
   "Start a review of DIFF, a diff of the repository at ROOT."
   (syringe--close-review)
+  (setq syringe--root root)
   (syringe--fill-diff-buffer diff root))
 
 (provide 'syringe)
