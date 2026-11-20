@@ -22,6 +22,8 @@
 ;;                              the new files
 ;;   syringe-toggle-dot         put a dot on this line, or remove the dot
 ;;                              that is there
+;;   syringe-next-dot           jump to the next dot
+;;   syringe-previous-dot       jump to the previous dot
 
 ;;; Code:
 
@@ -160,6 +162,20 @@ Put a dot on the line."
     (if conversation
         (syringe--delete-conversation conversation)
       (syringe--add-dot))))
+
+(defun syringe-next-dot ()
+  "Jump to the next dot below the current line."
+  (interactive)
+  (let ((dot (seq-find (lambda (dot) (> (overlay-start dot) (pos-eol)))
+                       (syringe--dots))))
+    (goto-char (overlay-start (or dot (user-error "No dot below this line"))))))
+
+(defun syringe-previous-dot ()
+  "Jump to the previous dot above the current line."
+  (interactive)
+  (let ((dot (seq-find (lambda (dot) (< (overlay-start dot) (pos-bol)))
+                       (reverse (syringe--dots)))))
+    (goto-char (overlay-start (or dot (user-error "No dot above this line"))))))
 
 ;;;; Windows
 
