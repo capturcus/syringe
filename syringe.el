@@ -11,6 +11,8 @@
 ;;   conversation  what you write about one line
 ;;
 ;; A dot in the left margin marks a line that has a conversation.
+;; When point comes to a line with a dot, the conversation window shows
+;; that conversation.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -78,6 +80,9 @@ When nil, the code window shows the place but the cursor stays in the diff."
 (defvar-local syringe--margin-added nil
   "Non-nil when this buffer's left margin has a column added for dots.")
 
+(defvar-local syringe--followed-line nil
+  "Start of the line point was on when `syringe--follow' last looked.")
+
 (defun syringe--dots ()
   "Return the dots of the current buffer, from top to bottom."
   (sort (seq-filter (lambda (ov) (overlay-get ov 'syringe-conversation))
@@ -101,10 +106,13 @@ When nil, the code window shows the place but the cursor stays in the diff."
 (defun syringe--sync ()
   "Adapt the current buffer to whether it has dots.
 While it has dots, the left margin gets one more column to draw them
-in.  Other packages draw in the left margin too, so the column is
-added to the width they asked for, and given back when the last dot
-goes."
+in, and the conversation window follows point (see `syringe--follow').
+Other packages draw in the left margin too, so the column is added to
+the width they asked for, and given back when the last dot goes."
   (let ((want (and (syringe--dots) t)))
+    (if want
+        (add-hook 'post-command-hook #'syringe--follow nil t)
+      (remove-hook 'post-command-hook #'syringe--follow t))
     (unless (eq want syringe--margin-added)
       (setq left-margin-width (max 0 (+ left-margin-width (if want 1 -1)))
             syringe--margin-added want)
@@ -112,7 +120,7 @@ goes."
         (set-window-margins win left-margin-width
                             (cdr (window-margins win)))))))
 
-;; Changing the major mode resets the margin; add the column again.
+;; Changing the major mode resets the margin and the hook; set them again.
 (add-hook 'after-change-major-mode-hook #'syringe--sync 90)
 
 (defun syringe--make-dot (conversation buffer position)
@@ -184,6 +192,24 @@ That is its dots and its buffer."
         (when (or (null distance) (< lines distance))
           (setq closest dot
                 distance lines))))))
+
+(defun syringe--follow ()
+  "Make the conversation window show the conversation of point's line.
+This runs after every command in a buffer that has dots.  It acts
+only when point has come to a different line, that line has a dot,
+and a conversation window is open."
+  (let ((line (pos-bol)))
+    (unless (eql line syringe--followed-line)
+      (setq syringe--followed-line line)
+      ;; An error here would make Emacs drop this function from the hook.
+      (with-demoted-errors "Syringe: %S"
+        (when-let* ((conversation (syringe--conversation-at-line))
+                    (win (syringe--window 'chat)))
+          (let ((buffer (syringe--chat-buffer conversation)))
+            (unless (eq buffer (window-buffer win))
+              (set-window-buffer win buffer)
+              (set-window-point win (with-current-buffer buffer
+                                      (point-max))))))))))
 
 (defun syringe--add-dot ()
   "Start a conversation about the current line and return it.
