@@ -389,5 +389,268 @@ With FAILED non-nil the robot fails instead, and TEXT says why."
                               (syringe-test-path "notes.txt")))
         (should (= (line-number-at-pos) 3))))))
 
+;;;; Dots
+
+(defun syringe-test-in-code (file line)
+  "Show FILE of the scratch repository in the code window; go to its LINE."
+  (select-window (syringe--show (find-file-noselect (syringe-test-path file))
+                                'code))
+  (goto-char (syringe--line-start (1- line))))
+
+(defun syringe-test-main ()
+  "Return the buffer that visits src/main.rs of the scratch repository."
+  (find-buffer-visiting (syringe-test-path "src/main.rs")))
+
+(defun syringe-test-dot (line)
+  "Put a dot on LINE of src/main.rs and return its conversation.
+The conversation is open afterwards, as the command leaves it."
+  (syringe-test-in-code "src/main.rs" line)
+  (syringe-toggle-dot)
+  (car syringe--conversations))
+
+(defun syringe-test-dots (buffer)
+  "Return the numbers of the lines of BUFFER that have a dot, from the top."
+  (with-current-buffer buffer
+    (mapcar (lambda (dot) (line-number-at-pos (overlay-start dot) t))
+            (syringe--dots))))
+
+(defun syringe-test-say (text)
+  "Type TEXT in the conversation that the current buffer shows and send it."
+  (goto-char (point-max))
+  (insert text)
+  (syringe-chat-send))
+
+(ert-deftest syringe-test-diff-lines ()
+  "Every line of a hunk knows its file and its line number there."
+  (syringe-test-with-repository
+    (syringe-test-write "src/main.rs" "// not committed\n" t)
+    (syringe-test-write "fresh.txt" "a new file\nof two lines\n")
+    (syringe-test-start)
+    (let* ((now (lambda (file)
+                  (with-temp-buffer
+                    (insert-file-contents (syringe-test-path file))
+                    (split-string (buffer-string) "\n"))))
+           (before (lambda (file)
+                     (split-string
+                      (syringe-test-git "show" (concat "HEAD~1:" file))
+                      "\n")))
+           (diff (syringe-test-diff))
+           (in-hunks (seq-count
+                      (lambda (line)
+                        (and (string-match-p "\\`[-+ ]" line)
+                             (not (string-match-p "\\`\\(?:---\\|\\+\\+\\+\\) "
+                                                  line))))
+                      (split-string (substring diff (string-search "\n@@" diff))
+                                    "\n")))
+           (checked 0))
+      (goto-char (point-min))
+      (while (not (eobp))
+        (pcase (syringe--diff-line-info)
+          (`(,file ,number ,kind)
+           (cl-incf checked)
+           (should (equal (buffer-substring-no-properties (1+ (point))
+                                                          (pos-eol))
+                          (nth (1- number)
+                               (funcall (if (eq kind ?-) before now)
+                                        file))))))
+        (forward-line 1))
+      ;; All the lines of the hunks were looked at, and no other line.
+      (should (= checked in-hunks)))))
+
+(ert-deftest syringe-test-diff-find ()
+  "A line is found in the diff by its file, its text and whether it is removed."
+  (with-temp-buffer
+    (insert "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+-same
+ keep
++same
+ last
+@@ -10,2 +10,3 @@
+ ten
++same
+ eleven
+diff --git a/two.txt b/two.txt
+--- a/two.txt
++++ b/two.txt
+@@ -1 +1,2 @@
+ first
++same
+")
+    ;; Each case is the file, the text, whether the line is removed, a
+    ;; line number in the file to be near to, and the line of the diff
+    ;; that is expected.
+    (pcase-dolist (`(,file ,text ,removed ,number ,expected)
+                   '(("one.txt" "same" t 2 5)
+                     ("one.txt" "same" nil 1 7)
+                     ("one.txt" "same" nil 6 7)
+                     ("one.txt" "same" nil 7 11)
+                     ("one.txt" "same" nil nil 7)
+                     ("one.txt" "keep" nil 1 6)
+                     ("one.txt" "keep" t 2 nil)
+                     ("two.txt" "same" nil 2 18)
+                     ("two.txt" "same" t 2 nil)
+                     ("three.txt" "same" nil 2 nil)))
+      (ert-info ((format "%S" (list file text removed number)))
+        (let ((found (syringe--diff-find file text removed number)))
+          (should (equal (and found (line-number-at-pos found))
+                         expected)))))))
+
+(ert-deftest syringe-test-dot-in-diff ()
+  "A dot on a line of the diff has a twin on that line of its file."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-in-diff "CHANGED ten")
+    (let ((line (line-number-at-pos)))
+      (syringe-toggle-dot)
+      (let ((conversation (car syringe--conversations)))
+        ;; The new conversation is open and named after its line.
+        (should (eq syringe--conversation conversation))
+        (should (equal (syringe-conversation-title conversation)
+                       "src/main.rs:10"))
+        (should (equal (syringe-test-dots syringe--diff-buffer) (list line)))
+        (should (equal (syringe-test-dots (syringe-test-main)) '(10)))
+        (with-current-buffer (syringe-test-main)
+          (goto-char (syringe--line-start 9))
+          (should (eq (syringe--conversation-at-line) conversation)))
+        ;; Removing the dot in the diff removes its twin and the
+        ;; conversation.
+        (syringe-test-in-diff "CHANGED ten")
+        (syringe-toggle-dot)
+        (should-not syringe--conversations)
+        (should-not (syringe-test-dots syringe--diff-buffer))
+        (should-not (syringe-test-dots (syringe-test-main)))
+        (should-not (buffer-live-p
+                     (syringe-conversation-buffer conversation)))))))
+
+(ert-deftest syringe-test-dot-in-code ()
+  "A dot on a line of a file has a twin in the diff if the diff has the line."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((changed (syringe-test-dot 10))
+          (unchanged (syringe-test-dot 9))
+          (elsewhere (syringe-test-dot 30)))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(9 10 30)))
+      (should (equal (syringe-conversation-title elsewhere) "src/main.rs:30"))
+      (should-not (syringe-conversation-diff-dot elsewhere))
+      (with-current-buffer syringe--diff-buffer
+        (pcase-dolist (`(,conversation . ,text)
+                       `((,changed
+                          . ,(concat "+" (syringe-test-line 10 "CHANGED ten")))
+                         (,unchanged . ,(concat " " (syringe-test-line 9)))))
+          (goto-char (overlay-start
+                      (syringe-conversation-diff-dot conversation)))
+          (should (equal (buffer-substring-no-properties (pos-bol) (pos-eol))
+                         text)))))))
+
+(ert-deftest syringe-test-dot-outside-code ()
+  "A line that is only in the diff gets a dot there and a name that says so."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (pcase-dolist (`(,text . ,title)
+                   '(("-fn function_40" . "src/main.rs:40 (removed)")
+                     ("Why the second commit." . "the commit message")
+                     ("+++ b/notes.txt" . "diff line %d")))
+      (syringe-test-in-diff text)
+      (let ((line (line-number-at-pos)))
+        (syringe-toggle-dot)
+        (let ((conversation (car syringe--conversations)))
+          (should (equal (syringe-conversation-title conversation)
+                         (format title line)))
+          (should (syringe-conversation-diff-dot conversation))
+          (should-not (syringe-conversation-code-dot conversation)))))
+    (should (= (length (syringe-test-dots syringe--diff-buffer)) 3))))
+
+(ert-deftest syringe-test-remove-dot ()
+  "Removing a dot asks first if its conversation has messages."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((conversation (syringe-test-dot 30)))
+      (syringe-test-say "why?")
+      (syringe-test-answer "because")
+      (setq syringe-test-yes nil)
+      (syringe-test-in-code "src/main.rs" 30)
+      (syringe-toggle-dot)
+      (should (= (length syringe-test-asked) 1))
+      (should (equal syringe--conversations (list conversation)))
+      (setq syringe-test-yes t)
+      (syringe-toggle-dot)
+      (should (= (length syringe-test-asked) 2))
+      (should-not syringe--conversations))
+    ;; A conversation without messages goes without a question.
+    (syringe-test-dot 30)
+    (syringe-test-in-code "src/main.rs" 30)
+    (syringe-toggle-dot)
+    (should (= (length syringe-test-asked) 2))
+    (should-not syringe--conversations)))
+
+(ert-deftest syringe-test-margin ()
+  "A buffer with dots has one more column in its left margin, and no more."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-in-code "src/main.rs" 1)
+    ;; As if another package had asked for two columns.
+    (setq left-margin-width 2)
+    (syringe-test-dot 5)
+    (syringe-test-dot 6)
+    (with-current-buffer (syringe-test-main)
+      (should (= left-margin-width 3)))
+    (syringe-test-in-code "src/main.rs" 5)
+    (syringe-toggle-dot)
+    (should (= left-margin-width 3))
+    (forward-line 1)
+    (syringe-toggle-dot)
+    (should (= left-margin-width 2))))
+
+(ert-deftest syringe-test-next-and-previous ()
+  "The next and previous commands walk the dots and stop at the ends."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (mapc #'syringe-test-dot '(20 5 50))
+    (syringe-test-in-code "src/main.rs" 1)
+    (dolist (line '(5 20 50))
+      (syringe-next-dot)
+      (should (= (line-number-at-pos) line)))
+    (should-error (syringe-next-dot) :type 'user-error)
+    (dolist (line '(20 5))
+      (syringe-previous-dot)
+      (should (= (line-number-at-pos) line)))
+    (should-error (syringe-previous-dot) :type 'user-error)))
+
+(ert-deftest syringe-test-open-closest ()
+  "The command that opens a conversation takes the dot closest to point."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((first (syringe-test-dot 5))
+          (second (syringe-test-dot 50)))
+      (pcase-dolist (`(,from ,to ,conversation)
+                     `((12 5 ,first) (40 50 ,second) (50 50 ,second)))
+        (syringe-test-in-code "src/main.rs" from)
+        (syringe-open-conversation)
+        (should (eq syringe--conversation conversation))
+        (with-selected-window (syringe--window 'code)
+          (should (= (line-number-at-pos) to)))))
+    (syringe-test-in-code "notes.txt" 1)
+    (should-error (syringe-open-conversation) :type 'user-error)))
+
+(ert-deftest syringe-test-follow ()
+  "The conversation window shows the conversation of the line point is on."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((first (syringe-test-dot 5))
+          (second (syringe-test-dot 50)))
+      ;; The line between the two has no dot and changes nothing.
+      (pcase-dolist (`(,line . ,conversation)
+                     `((5 . ,first) (50 . ,second) (20 . ,second)))
+        (syringe-test-in-code "src/main.rs" line)
+        (run-hooks 'post-command-hook)
+        (should (eq (window-buffer (syringe--window 'chat))
+                    (syringe-conversation-buffer conversation)))
+        ;; The cursor stays in the code.
+        (should (eq (syringe--window-role (selected-window)) 'code))))))
+
 (provide 'syringe-test)
 ;;; syringe-test.el ends here
