@@ -30,6 +30,9 @@ The subject of a commit starts with the part that it changes.  For
     reviews   saving reviews and opening them again
     keys      the key bindings at the end of the file
 
+What makes the file a package that can be installed, its headers and
+its autoload cookies, is `package`.
+
 The other files are named by themselves: `build` for the Makefile and
 `tools`, `test`, `doc`, `gitignore`.
 
