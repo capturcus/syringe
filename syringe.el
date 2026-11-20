@@ -1,5 +1,7 @@
 ;;; syringe.el --- Review code in three windows: diff, live code, conversation  -*- lexical-binding: t; -*-
 
+;; Version: 0.1
+
 ;;; Commentary:
 
 ;; Syringe helps you understand a change by reading it yourself.
