@@ -98,9 +98,10 @@ Rules:
   read earlier, read the file again.
 
 The review has several conversations, each about one line.  My first
-message in a conversation says which line.  A message may begin with
-what was said in the other conversations since your last answer; treat
-that as shared knowledge.
+message in a conversation says which line, and a later message says so
+when that line has moved or changed.  A message may begin with what
+was said in the other conversations since your last answer; treat that
+as shared knowledge.
 
 Now read the change and the code around it, so that you are ready for
 questions.  Read all of the change, in several steps if it is long.
@@ -171,6 +172,7 @@ on the same line in the live code."
   diff-text        ; the line of the diff, with its first character
   diff-number      ; its line number in that file
   lost             ; non-nil when the line is not found any more
+  told             ; (PLACE . TEXT): what the robot last heard about the line
   (state 'read)    ; `read', `thinking', `unread' or `error': the dot's color
   activity         ; what the robot is doing while it thinks, a string or nil
   session          ; the robot session, or nil before the first message
@@ -1172,22 +1174,37 @@ The value is (PLACE . TEXT), with PLACE a string such as
 
 (defun syringe--prompt (conversation text first where)
   "Return what to send to the robot for your message TEXT in CONVERSATION.
-The news from the other conversations comes first.  On the FIRST
-message, which line the conversation is about comes next.  WHERE is
-where the line is now; see `syringe--where'."
+The news from the other conversations comes first.  Then comes what
+the robot has to know about the line.  On the FIRST message that is
+which line the conversation is about.  Later it is a sentence when
+the line has moved, changed or got lost since the robot last heard
+of it.  WHERE is where the line is now; see `syringe--where'."
   (let* ((news (syringe--news conversation))
+         (told (syringe-conversation-told conversation))
          (about
-          (and first
-               (concat
-                (if where
-                    (format "This conversation is about %s.  The line is:\n%s"
-                            (car where) (cdr where))
-                  (format "This conversation is about %s, a line that is \
+          (cond (first
+                 (concat
+                  (if where
+                      (format "This conversation is about %s.  The line is:\n%s"
+                              (car where) (cdr where))
+                    (format "This conversation is about %s, a line that is \
 no longer in the code: it was deleted or rewritten."
-                          (syringe-conversation-title conversation)))
-                (and (plist-get syringe--about :changed)
-                     "\nThe code has been edited since you read the change; \
-look at the files as they are now.")))))
+                            (syringe-conversation-title conversation)))
+                  (and (plist-get syringe--about :changed)
+                       "\nThe code has been edited since you read the change; \
+look at the files as they are now.")))
+                ((equal where told) nil)
+                ((null where)
+                 "The line this conversation is about is no longer in the \
+code: it was deleted or rewritten.")
+                ((equal (cdr where) (cdr told))
+                 (format "The line this conversation is about has moved: it \
+is now %s."
+                         (car where)))
+                (t
+                 (format "The line this conversation is about has changed.  \
+It is now %s and reads:\n%s"
+                         (car where) (cdr where))))))
     (string-join
      (delq nil
            (list (and news
@@ -1238,8 +1255,10 @@ M-x syringe-start-last-commit or M-x syringe-start-unstaged")))
                      (syringe--set-state conversation 'thinking activity)))
                  (lambda (ok answer)
                    (if ok
-                       ;; The robot now knows the log up to this message.
-                       (setf (syringe-conversation-heard conversation) heard)
+                       ;; The robot now knows the log up to this message,
+                       ;; and where the line is.
+                       (setf (syringe-conversation-heard conversation) heard
+                             (syringe-conversation-told conversation) where)
                      ;; A first message that failed never said what the
                      ;; conversation is about, so start over next time.
                      (when first
@@ -1729,6 +1748,7 @@ The newest comes first."
     state
     session
     heard
+    told
     lost
     code-file
     code-line
