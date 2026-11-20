@@ -207,18 +207,18 @@ diff has changed since the robot read it.")
 (defvar syringe--revision-history nil
   "The revisions that were typed to start a review, the newest first.")
 
-(defvar syringe--base nil
+(defvar syringe--session nil
   "The robot session that read the diff when the review started.
 Every conversation is held in it.")
 
-(defvar syringe--base-state nil
-  "State of `syringe--base': `preparing', `ready', `failed', or nil.")
+(defvar syringe--session-state nil
+  "State of `syringe--session': `preparing', `ready', `failed', or nil.")
 
-(defvar syringe--base-process nil
+(defvar syringe--session-process nil
   "The robot process that reads the diff, while it runs.")
 
-(defvar syringe--base-error nil
-  "Why `syringe--base' failed, a string.")
+(defvar syringe--session-error nil
+  "Why `syringe--session' failed, a string.")
 
 (defvar syringe--asking nil
   "The conversation whose message the robot is working on, or nil.")
@@ -1174,48 +1174,48 @@ The answer arrives in the background."
 ;; answers.  It reaches the robot only through the two functions of
 ;; the engine, at the end of this file.
 
-(defun syringe--prepare-base ()
-  "Start the robot session that reads the diff; see `syringe--base'."
-  (let ((old syringe--base-process)
-        (base (syringe-engine-new-session)))
-    (setq syringe--base base
-          syringe--base-state 'preparing
-          syringe--base-error nil)
+(defun syringe--start-session ()
+  "Start the robot session that reads the diff; see `syringe--session'."
+  (let ((old syringe--session-process)
+        (session (syringe-engine-new-session)))
+    (setq syringe--session session
+          syringe--session-state 'preparing
+          syringe--session-error nil)
     ;; After the new session is set, so that the end of the old one is
     ;; ignored below.
     (when (process-live-p old)
       (delete-process old))
     (condition-case err
-        (setq syringe--base-process
+        (setq syringe--session-process
               (syringe-engine-send
-               base
+               session
                (format syringe-brief
                        (syringe--change-description
                         (plist-get syringe--about :kind)))
                syringe--root
                #'ignore
                (lambda (ok text)
-                 (when (equal base syringe--base)
-                   (syringe--base-done ok text)))))
-      (error (syringe--base-done nil (error-message-string err))))))
+                 (when (equal session syringe--session)
+                   (syringe--session-started ok text)))))
+      (error (syringe--session-started nil (error-message-string err))))))
 
-(defun syringe--base-done (ok text)
+(defun syringe--session-started (ok text)
   "Note that the robot has finished reading the diff.
 OK is non-nil if that worked; if not, TEXT says why.  Then the robot
 is free for the first message that waited for it."
-  (setq syringe--base-state (if ok 'ready 'failed)
-        syringe--base-error (unless ok
-                              (format "The robot could not read the diff: %s"
-                                      text)))
+  (setq syringe--session-state (if ok 'ready 'failed)
+        syringe--session-error (unless ok
+                                 (format "The robot could not read the diff: %s"
+                                         text)))
   (message "Syringe: %s"
-           (if ok "the robot has read the diff" syringe--base-error))
+           (if ok "the robot has read the diff" syringe--session-error))
   (force-mode-line-update t)
   (syringe--save)
   (syringe--ask-next))
 
-(defun syringe--base-indicator ()
+(defun syringe--session-indicator ()
   "Return what the mode line of the diff says about the robot."
-  (pcase syringe--base-state
+  (pcase syringe--session-state
     ('preparing " [robot: reading the diff]")
     ('ready " [robot: ready]")
     ('failed " [robot: failed]")))
@@ -1296,7 +1296,7 @@ changed.  It is now %s and reads:\n%s"
 The answer comes later, through `syringe--answer'.  The robot does
 one thing at a time: while it reads the diff or works on another
 message, this one waits for its turn."
-  (let ((busy (cond ((eq syringe--base-state 'preparing)
+  (let ((busy (cond ((eq syringe--session-state 'preparing)
                      "waiting for the robot to finish reading the diff")
                     (syringe--asking
                      (format "waiting for the robot to answer in %s"
@@ -1314,7 +1314,7 @@ message of a conversation that still exists."
   (unless (memq syringe--asking syringe--conversations)
     (setq syringe--asking nil))
   (unless (or syringe--asking
-              (eq syringe--base-state 'preparing)
+              (eq syringe--session-state 'preparing)
               (null syringe--waiting))
     (let ((next (pop syringe--waiting)))
       (syringe--ask-now (car next) (cdr next)))))
@@ -1325,13 +1325,13 @@ message of a conversation that still exists."
   (syringe--set-state conversation 'thinking)
   (condition-case err
       (let ((where (syringe--where conversation)))
-        (unless (eq syringe--base-state 'ready)
-          (error "%s" (or syringe--base-error
+        (unless (eq syringe--session-state 'ready)
+          (error "%s" (or syringe--session-error
                           "No review is running; start one with \
 M-x syringe-start")))
         (setf (syringe-conversation-process conversation)
               (syringe-engine-send
-               syringe--base
+               syringe--session
                (syringe--prompt conversation text where)
                syringe--root
                (lambda (activity)
@@ -1522,7 +1522,7 @@ has been edited."
 RET goes to the live code for the line at point."
   (setq buffer-read-only t
         diff-mode-read-only t
-        mode-line-process '(:eval (syringe--base-indicator)))
+        mode-line-process '(:eval (syringe--session-indicator)))
   ;; `g' takes the diff of the review again.
   (setq-local revert-buffer-function
               (lambda (&rest _) (syringe--refresh-by-hand))))
@@ -1890,8 +1890,8 @@ answered.  Send your message again.")))))
   (when syringe--file
     (let ((data (list :version 1
                       :about syringe--about
-                      :base syringe--base
-                      :base-ready (eq syringe--base-state 'ready)
+                      :session syringe--session
+                      :session-ready (eq syringe--session-state 'ready)
                       :conversations (mapcar #'syringe--conversation-data
                                              syringe--conversations)))
           (new (concat syringe--file ".new"))
@@ -1909,16 +1909,16 @@ answered.  Send your message again.")))))
   "Save the current review, if there is one, and take it off the screen."
   (syringe--save)
   (let ((conversations syringe--conversations)
-        (process syringe--base-process))
+        (process syringe--session-process))
     ;; Forget the review first, so that what its robots still report
     ;; when they are stopped is ignored.
     (setq syringe--conversations nil
           syringe--file nil
           syringe--about nil
-          syringe--base nil
-          syringe--base-state nil
-          syringe--base-process nil
-          syringe--base-error nil
+          syringe--session nil
+          syringe--session-state nil
+          syringe--session-process nil
+          syringe--session-error nil
           syringe--asking nil
           syringe--asked-last nil
           syringe--waiting nil)
@@ -1949,7 +1949,7 @@ the commit that is checked out, which the review belongs to."
                 :commit commit
                 :head (syringe--git root "log" "-1" "--format=%h %s")))
     (syringe--fill-diff-buffer diff root)
-    (syringe--prepare-base)
+    (syringe--start-session)
     (syringe--save)))
 
 (defun syringe--open-review (file root)
@@ -1963,8 +1963,8 @@ saved; the dots are put where the lines of the conversations are now."
     (setq syringe--file file
           syringe--root root
           syringe--about (plist-get data :about)
-          syringe--base (plist-get data :base)
-          syringe--base-state (and (plist-get data :base-ready) 'ready)
+          syringe--session (plist-get data :session)
+          syringe--session-state (and (plist-get data :session-ready) 'ready)
           syringe--conversations (mapcar #'syringe--conversation-from-data
                                          (plist-get data :conversations)))
     (syringe--fill-diff-buffer diff root)
@@ -1976,8 +1976,8 @@ saved; the dots are put where the lines of the conversations are now."
         (when (syringe--in-review-p)
           (syringe--settle-buffer t))))
     ;; The robot had not finished reading the diff when the review closed.
-    (unless (eq syringe--base-state 'ready)
-      (syringe--prepare-base))))
+    (unless (eq syringe--session-state 'ready)
+      (syringe--start-session))))
 
 (defun syringe--review-label (file)
   "Return the line that shows the review saved in FILE in a list.

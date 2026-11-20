@@ -1023,13 +1023,13 @@ the choice has.  Return the choices that were offered, in order."
   (syringe-test-with-repository
     (syringe-start syringe-test-root "HEAD~1")
     (should (= (length syringe-test-sent) 1))
-    (should (equal (caar syringe-test-sent) syringe--base))
+    (should (equal (caar syringe-test-sent) syringe--session))
     (should (string-search "\"git diff HEAD~1\"" (syringe-test-prompt)))
     (should (string-search "Help me think, don't think for me."
                            (syringe-test-prompt)))
-    (should (equal (syringe--base-indicator) " [robot: reading the diff]"))
+    (should (equal (syringe--session-indicator) " [robot: reading the diff]"))
     (syringe-test-answer "ready")
-    (should (equal (syringe--base-indicator) " [robot: ready]"))
+    (should (equal (syringe--session-indicator) " [robot: ready]"))
     ;; A review of the unstaged changes names another command.
     (syringe-test-write "notes.txt" "not committed\n" t)
     (syringe-start syringe-test-root)
@@ -1043,7 +1043,7 @@ the choice has.  Return the choices that were offered, in order."
     (let ((conversation (syringe-test-dot 30)))
       (syringe-test-say "why?")
       ;; It goes to the session that read the change.
-      (should (equal (caar syringe-test-sent) syringe--base))
+      (should (equal (caar syringe-test-sent) syringe--session))
       (should (equal (syringe-test-prompt)
                      (concat "This is a new conversation, about "
                              "src/main.rs:30.  The line is:\n"
@@ -1055,7 +1055,7 @@ the choice has.  Return the choices that were offered, in order."
       ;; The next message of the conversation goes there as it is.
       (syringe-test-say "and then?")
       (should (equal (seq-take (car syringe-test-sent) 2)
-                     (list syringe--base "and then?"))))))
+                     (list syringe--session "and then?"))))))
 
 (ert-deftest syringe-test-states ()
   "A conversation is thinking, read, unread or failed, and its dot shows it."
@@ -1133,7 +1133,7 @@ the choice has.  Return the choices that were offered, in order."
   (syringe-test-with-repository
     (syringe-start syringe-test-root "HEAD~1")
     (syringe-test-answer "no network" t)
-    (should (equal (syringe--base-indicator) " [robot: failed]"))
+    (should (equal (syringe--session-indicator) " [robot: failed]"))
     (let ((conversation (syringe-test-dot 30)))
       (syringe-test-say "why?")
       (should-not syringe-test-sent)
@@ -1155,7 +1155,7 @@ the choice has.  Return the choices that were offered, in order."
       ;; Another conversation, in the same session.
       (syringe--open-chat second)
       (syringe-test-say "and thirty?")
-      (should (equal (caar syringe-test-sent) syringe--base))
+      (should (equal (caar syringe-test-sent) syringe--session))
       (should (string-prefix-p
                "This is a new conversation, about src/main.rs:30."
                (syringe-test-prompt)))
