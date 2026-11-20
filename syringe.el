@@ -8,7 +8,7 @@
 ;;   diff          what changed, under the message of the commit; RET
 ;;                 goes to that place in the live code
 ;;   live code     the real files, to read around in and to edit
-;;   conversation  what you write about one line
+;;   conversation  a chat with the robot about one line
 ;;
 ;; A dot in the left margin marks a line that has a conversation.  A
 ;; line that is both in the diff and in the live code has a dot in both
@@ -25,6 +25,7 @@
 ;;
 ;; The robot is a coding agent that can read the repository but not
 ;; change it.  When a review starts, one robot session reads the diff.
+;; Every conversation continues from a copy of that session.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -86,6 +87,9 @@ Rules:
 - I edit the code while we talk.  Before you rely on something you
   read earlier, read the file again.
 
+The review has several conversations, each about one line.  My first
+message in a conversation says which line.
+
 Now read the change and the code around it, so that you are ready for
 questions.  Read all of the change, in several steps if it is long.
 Then reply with the single word: ready"
@@ -105,6 +109,12 @@ review, not to the running one."
 
 (defface syringe-user '((t :inherit font-lock-keyword-face))
   "Face of your messages in a conversation.")
+
+(defface syringe-robot '((t :inherit font-lock-string-face))
+  "Face of the robot's messages in a conversation.")
+
+(defface syringe-error '((t :inherit error))
+  "Face of an error message in a conversation.")
 
 (defface syringe-prompt '((t :inherit minibuffer-prompt))
   "Face of the prompt in a conversation.")
@@ -138,7 +148,10 @@ on the same line in the live code."
   diff-file        ; the file whose part of the diff it is in, or nil
   diff-text        ; the line of the diff, with its first character
   diff-number      ; its line number in that file
-  lost)            ; non-nil when the line is not found any more
+  lost             ; non-nil when the line is not found any more
+  (state 'read)    ; `read', `thinking' or `error'
+  session          ; the robot session, or nil before the first message
+  process)         ; the robot process while it thinks, or nil
 
 (defvar syringe--conversations nil
   "Every conversation, newest first.")
@@ -150,7 +163,8 @@ on the same line in the live code."
   "Facts about the current review, a property list.
 :created is when it started and :kind what it reviews, `last-commit'
 or `unstaged'.  :commit is the commit the review belongs to and :head
-its short name and subject.")
+its short name and subject.  :changed is non-nil once the diff has
+changed since the robot read it.")
 
 (defvar syringe--refresh-timer nil
   "The timer that takes the diff again once Emacs is idle, or nil.")
@@ -173,6 +187,9 @@ Every conversation continues from a copy of it.")
 
 (defvar syringe--base-error nil
   "Why `syringe--base' failed, a string.")
+
+(defvar syringe--base-waiting nil
+  "Functions to call once `syringe--base' is ready or has failed.")
 
 (defconst syringe--diff-buffer "*syringe-diff*"
   "Name of the buffer that shows the diff under review.")
@@ -531,9 +548,21 @@ It is gray if the line is lost."
                   (syringe--live-dot
                    (syringe-conversation-code-dot conversation)))))
 
+(defun syringe--set-state (conversation state)
+  "Put CONVERSATION in STATE and show it.
+STATE is `read', `thinking' or `error'; the conversation's header
+line shows it."
+  (setf (syringe-conversation-state conversation) state)
+  (let ((buffer (syringe-conversation-buffer conversation)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (force-mode-line-update)))))
+
 (defun syringe--drop (conversation)
-  "Take CONVERSATION off the screen.
-That is its dots and its buffer."
+  "Take CONVERSATION off the screen and stop its robot.
+That is its dots, its buffer and its robot process."
+  (when (process-live-p (syringe-conversation-process conversation))
+    (delete-process (syringe-conversation-process conversation)))
   (dolist (dot (syringe--live-dots conversation))
     (with-current-buffer (overlay-buffer dot)
       (delete-overlay dot)
@@ -543,6 +572,7 @@ That is its dots and its buffer."
 
 (defun syringe--delete-conversation (conversation)
   "Delete CONVERSATION for good."
+  ;; First, so that the robot's reply to a killed process is ignored.
   (setq syringe--conversations (delq conversation syringe--conversations))
   (syringe--drop conversation)
   (syringe--save))
@@ -803,13 +833,17 @@ Type after the prompt and press RET to send the message."
   (add-hook 'kill-buffer-hook #'syringe--leave-windows nil t))
 
 (defun syringe--chat-header ()
-  "Return the header line of a conversation buffer: its title."
+  "Return the header line of a conversation buffer.
+It shows the title and whether the robot is thinking."
   (let ((conversation syringe--conversation))
     (when conversation
       ;; A % would be read as a mode line construct.
       (string-replace
        "%" "%%"
-       (concat " " (syringe-conversation-title conversation))))))
+       (concat " " (syringe-conversation-title conversation)
+               (pcase (syringe-conversation-state conversation)
+                 ('thinking "  —  thinking")
+                 ('error "  —  failed")))))))
 
 (defun syringe--leave-windows ()
   "Take the conversation buffer that is being killed out of its windows.
@@ -828,19 +862,22 @@ the window if there is none."
         (ignore-errors (delete-window win))))))
 
 (defun syringe--render-message (role text)
-  "Insert the message TEXT, written by ROLE, just above the prompt."
+  "Insert the message TEXT, written by ROLE, just above the prompt.
+The color tells who wrote it."
   (let ((inhibit-read-only t))
     (save-excursion
       (goto-char (- syringe--input-start (length syringe--prompt)))
       (insert (propertize (concat text "\n")
                           'face (pcase role
-                                  ('user 'syringe-user))
+                                  ('user 'syringe-user)
+                                  ('robot 'syringe-robot)
+                                  (_ 'syringe-error))
                           'read-only t
                           'front-sticky '(read-only))))))
 
 (defun syringe--say (conversation role text)
   "Add the message TEXT, written by ROLE, to CONVERSATION.
-ROLE is `user'; nobody else writes yet."
+ROLE is `user', `robot' or `error'."
   (setf (syringe-conversation-messages conversation)
         (append (syringe-conversation-messages conversation)
                 (list (cons role text))))
@@ -851,16 +888,20 @@ ROLE is `user'; nobody else writes yet."
   (syringe--save))
 
 (defun syringe-chat-send ()
-  "Add the text typed after the prompt to the conversation."
+  "Send the text typed after the prompt to the robot.
+The answer arrives in the background."
   (interactive)
   (let ((conversation syringe--conversation)
         (text (string-trim (buffer-substring-no-properties
                             syringe--input-start (point-max)))))
+    (when (eq (syringe-conversation-state conversation) 'thinking)
+      (user-error "The robot is still thinking about your last message"))
     (when (string-empty-p text)
       (user-error "Type a message first"))
     (delete-region syringe--input-start (point-max))
     (syringe--say conversation 'user text)
-    (goto-char (point-max))))
+    (goto-char (point-max))
+    (syringe--ask conversation text)))
 
 (defun syringe--chat-buffer (conversation)
   "Return the buffer that shows CONVERSATION, creating it if needed."
@@ -907,7 +948,8 @@ ROLE is `user'; nobody else writes yet."
         (base (syringe-engine-new-session)))
     (setq syringe--base base
           syringe--base-state 'preparing
-          syringe--base-error nil)
+          syringe--base-error nil
+          syringe--base-waiting nil)
     ;; After the new session is set, so that the end of the old one is
     ;; ignored below.
     (when (process-live-p old)
@@ -928,7 +970,8 @@ ROLE is `user'; nobody else writes yet."
 
 (defun syringe--base-done (ok text)
   "Note that the robot has finished reading the diff.
-OK is non-nil if that worked; if not, TEXT says why."
+OK is non-nil if that worked; if not, TEXT says why.  Then send the
+messages that were waiting for it."
   (setq syringe--base-state (if ok 'ready 'failed)
         syringe--base-error (unless ok
                               (format "The robot could not read the diff: %s"
@@ -936,7 +979,10 @@ OK is non-nil if that worked; if not, TEXT says why."
   (message "Syringe: %s"
            (if ok "the robot has read the diff" syringe--base-error))
   (force-mode-line-update t)
-  (syringe--save))
+  (syringe--save)
+  (let ((waiting (nreverse syringe--base-waiting)))
+    (setq syringe--base-waiting nil)
+    (mapc #'funcall waiting)))
 
 (defun syringe--base-indicator ()
   "Return what the mode line of the diff says about the robot."
@@ -944,6 +990,102 @@ OK is non-nil if that worked; if not, TEXT says why."
     ('preparing " [robot: reading the diff]")
     ('ready " [robot: ready]")
     ('failed " [robot: failed]")))
+
+(defun syringe--where (conversation)
+  "Return where the line of CONVERSATION is now and how it reads.
+The value is (PLACE . TEXT), with PLACE a string such as
+\"src/main.c:42\", or nil if the line is lost."
+  (let ((dot (syringe--live-dot (syringe-conversation-code-dot conversation))))
+    (cond ((syringe-conversation-lost conversation) nil)
+          ;; The dot knows best: it follows edits that are not saved yet.
+          ((and dot (< (overlay-start dot) (overlay-end dot)))
+           (with-current-buffer (overlay-buffer dot)
+             (save-excursion
+               (goto-char (overlay-start dot))
+               (cons (if (syringe-conversation-code-file conversation)
+                         (format "%s:%d"
+                                 (syringe-conversation-code-file conversation)
+                                 (line-number-at-pos nil t))
+                       (syringe-conversation-title conversation))
+                     (buffer-substring-no-properties (pos-bol) (pos-eol))))))
+          ((syringe-conversation-code-file conversation)
+           (cons (syringe-conversation-title conversation)
+                 (syringe-conversation-code-text conversation)))
+          (t
+           (cons (syringe-conversation-title conversation)
+                 (or (syringe-conversation-diff-text conversation) ""))))))
+
+(defun syringe--prompt (conversation text first where)
+  "Return what to send to the robot for your message TEXT in CONVERSATION.
+On the FIRST message, which line the conversation is about comes
+first.  WHERE is where the line is now; see `syringe--where'."
+  (let ((about
+         (and first
+              (concat
+               (if where
+                   (format "This conversation is about %s.  The line is:\n%s"
+                           (car where) (cdr where))
+                 (format "This conversation is about %s, a line that is \
+no longer in the code: it was deleted or rewritten."
+                         (syringe-conversation-title conversation)))
+               (and (plist-get syringe--about :changed)
+                    "\nThe code has been edited since you read the change; \
+look at the files as they are now.")))))
+    (string-join
+     (delq nil
+           (list about
+                 (if about
+                     (concat "My message:\n" text)
+                   text)))
+     "\n\n")))
+
+(defun syringe--ask (conversation text)
+  "Send your message TEXT in CONVERSATION to the robot.
+The answer comes later, through `syringe--answer'.  If the robot is
+still reading the diff, the message waits for that."
+  (syringe--set-state conversation 'thinking)
+  (if (eq syringe--base-state 'preparing)
+      (push (lambda () (syringe--ask-now conversation text))
+            syringe--base-waiting)
+    (syringe--ask-now conversation text)))
+
+(defun syringe--ask-now (conversation text)
+  "Run the robot on your message TEXT in CONVERSATION."
+  ;; The conversation may have been deleted while the message waited.
+  (when (memq conversation syringe--conversations)
+    (condition-case err
+        (let ((first (null (syringe-conversation-session conversation)))
+              (where (syringe--where conversation)))
+          (when first
+            (unless (eq syringe--base-state 'ready)
+              (error "%s" (or syringe--base-error
+                              "No review is running; start one with \
+M-x syringe-start-last-commit or M-x syringe-start-unstaged")))
+            (setf (syringe-conversation-session conversation)
+                  (syringe-engine-fork syringe--base)))
+          (setf (syringe-conversation-process conversation)
+                (syringe-engine-send
+                 (syringe-conversation-session conversation)
+                 (syringe--prompt conversation text first where)
+                 syringe--root
+                 #'ignore
+                 (lambda (ok answer)
+                   ;; A first message that failed never said what the
+                   ;; conversation is about, so start over next time.
+                   (when (and first (not ok))
+                     (setf (syringe-conversation-session conversation) nil))
+                   (syringe--answer conversation ok answer)))))
+      (error (syringe--answer conversation nil (error-message-string err))))))
+
+(defun syringe--answer (conversation ok text)
+  "Take the robot's reply to the last message in CONVERSATION.
+OK is non-nil if the robot answered; TEXT is then its answer, and
+otherwise the reason it failed."
+  (when (memq conversation syringe--conversations)
+    (setf (syringe-conversation-process conversation) nil)
+    (syringe--say conversation (if ok 'robot 'error) text)
+    (syringe--set-state conversation (if ok 'read 'error))
+    (syringe--save)))
 
 ;;;; The diff
 
@@ -1241,6 +1383,9 @@ Do nothing if the diff has not changed."
               (set-window-point win (syringe--line-start (1- point)))
               (set-window-start win (syringe--line-start (1- start)))))
           (syringe--place-diff-dots)
+          ;; From now on a new conversation tells the robot that the
+          ;; code is not what it read.
+          (setq syringe--about (plist-put syringe--about :changed t))
           (syringe--write-text (syringe--diff-file syringe--file) diff)
           (syringe--save))))))
 
@@ -1402,6 +1547,8 @@ The newest comes first."
 
 (defconst syringe--saved-slots
   '(title
+    state
+    session
     lost
     code-file
     code-line
@@ -1427,6 +1574,17 @@ The newest comes first."
     (dolist (slot syringe--saved-slots)
       (setf (cl-struct-slot-value 'syringe-conversation slot conversation)
             (plist-get data (intern (format ":%s" slot)))))
+    ;; The review was closed while the robot was thinking.
+    (when (eq (syringe-conversation-state conversation) 'thinking)
+      ;; If that was the first message, the robot may not know what the
+      ;; conversation is about; start its session again.
+      (unless (assq 'robot (syringe-conversation-messages conversation))
+        (setf (syringe-conversation-session conversation) nil))
+      (setf (syringe-conversation-state conversation) 'error
+            (syringe-conversation-messages conversation)
+            (append (syringe-conversation-messages conversation)
+                    (list (cons 'error "The robot was stopped before it \
+answered.  Send your message again.")))))
     conversation))
 
 (defun syringe--save ()
@@ -1462,7 +1620,8 @@ The newest comes first."
           syringe--base nil
           syringe--base-state nil
           syringe--base-process nil
-          syringe--base-error nil)
+          syringe--base-error nil
+          syringe--base-waiting nil)
     (when (process-live-p process)
       (delete-process process))
     (mapc #'syringe--drop conversations)))
