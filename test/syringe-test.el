@@ -1045,25 +1045,20 @@ the choice has.  Return the choices that were offered, in order."
     (syringe-test-start)
     (let ((conversation (syringe-test-dot 30)))
       (syringe-test-say "why?")
-      ;; The conversation has a session of its own, a copy of the one
-      ;; that read the change.
-      (should (equal (caar syringe-test-sent)
-                     (syringe-conversation-session conversation)))
-      (should (string-prefix-p (concat syringe--base "/")
-                               (syringe-conversation-session conversation)))
+      ;; It goes to the session that read the change.
+      (should (equal (caar syringe-test-sent) syringe--base))
       (should (equal (syringe-test-prompt)
-                     (concat "This conversation is about src/main.rs:30.  "
-                             "The line is:\n"
+                     (concat "This is a new conversation, about "
+                             "src/main.rs:30.  The line is:\n"
                              (syringe-test-line 30)
                              "\n\nMy message:\nwhy?")))
       (syringe-test-answer "because")
       (should (equal (syringe-conversation-messages conversation)
                      '((user . "why?") (robot . "because"))))
-      ;; The next message goes to the same session, as it is.
+      ;; The next message of the conversation goes there as it is.
       (syringe-test-say "and then?")
       (should (equal (seq-take (car syringe-test-sent) 2)
-                     (list (syringe-conversation-session conversation)
-                           "and then?"))))))
+                     (list syringe--base "and then?"))))))
 
 (ert-deftest syringe-test-states ()
   "A conversation is thinking, read, unread or failed, and its dot shows it."
@@ -1114,16 +1109,13 @@ the choice has.  Return the choices that were offered, in order."
   "After a first message that failed, the conversation starts over."
   (syringe-test-with-repository
     (syringe-test-start)
-    (let ((conversation (syringe-test-dot 30)))
-      (syringe-test-say "why?")
-      (let ((session (syringe-conversation-session conversation)))
-        (syringe-test-answer "no network" t)
-        (should-not (syringe-conversation-session conversation))
-        (syringe-test-say "why, again?")
-        (should-not (equal (syringe-conversation-session conversation)
-                           session))
-        (should (string-prefix-p "This conversation is about src/main.rs:30."
-                                 (syringe-test-prompt)))))))
+    (syringe-test-dot 30)
+    (syringe-test-say "why?")
+    (syringe-test-answer "no network" t)
+    ;; The robot may never have heard what the conversation is about.
+    (syringe-test-say "why, again?")
+    (should (string-prefix-p "This is a new conversation, about src/main.rs:30."
+                             (syringe-test-prompt)))))
 
 (ert-deftest syringe-test-message-waits ()
   "A message that is sent while the robot reads the change waits for that."
@@ -1154,8 +1146,8 @@ the choice has.  Return the choices that were offered, in order."
         (should (eq role 'error))
         (should (string-search "no network" text))))))
 
-(ert-deftest syringe-test-news ()
-  "A message tells the robot what was said in the other conversations."
+(ert-deftest syringe-test-conversations-in-turn ()
+  "A message says so when it goes to another conversation than the last."
   (syringe-test-with-repository
     (syringe-test-start)
     (let ((first (syringe-test-dot 5))
@@ -1163,38 +1155,85 @@ the choice has.  Return the choices that were offered, in order."
       (syringe--open-chat first)
       (syringe-test-say "what is five?")
       (syringe-test-answer "a function")
+      ;; Another conversation, in the same session.
       (syringe--open-chat second)
       (syringe-test-say "and thirty?")
-      (should (equal (syringe-test-prompt)
-                     (concat "Said in the other conversations of this review "
-                             "since your last answer here:\n\n"
-                             "[src/main.rs:5] Me: what is five?\n\n"
-                             "[src/main.rs:5] You: a function\n\n"
-                             "This conversation is about src/main.rs:30.  "
-                             "The line is:\n"
-                             (syringe-test-line 30)
-                             "\n\nMy message:\nand thirty?")))
+      (should (equal (caar syringe-test-sent) syringe--base))
+      (should (string-prefix-p
+               "This is a new conversation, about src/main.rs:30."
+               (syringe-test-prompt)))
       (syringe-test-answer "another function")
-      ;; The news is told once.
+      ;; A message that goes on where the last one was says nothing more.
       (syringe-test-say "sure?")
       (should (equal (syringe-test-prompt) "sure?"))
       (syringe-test-answer "yes")
-      ;; The other conversation hears what was said here, not itself.
+      ;; Back in the first conversation.
       (syringe--open-chat first)
       (syringe-test-say "more?")
       (should (equal (syringe-test-prompt)
-                     (concat "Said in the other conversations of this review "
-                             "since your last answer here:\n\n"
-                             "[src/main.rs:30] Me: and thirty?\n\n"
-                             "[src/main.rs:30] You: another function\n\n"
-                             "[src/main.rs:30] Me: sure?\n\n"
-                             "[src/main.rs:30] You: yes\n\n"
-                             "My message:\nmore?")))
-      ;; A message that failed did not deliver the news; it is told again.
+                     (concat "Back to the conversation about src/main.rs:5."
+                             "\n\nMy message:\nmore?")))
+      ;; A message that failed may not have reached the robot, so the
+      ;; next one says again where it belongs.
       (syringe-test-answer "no network" t)
       (syringe-test-say "more, please?")
-      (should (string-search "[src/main.rs:30] You: yes"
-                             (syringe-test-prompt))))))
+      (should (string-prefix-p "Back to the conversation about src/main.rs:5."
+                               (syringe-test-prompt)))
+      (syringe-test-answer "there is no more")
+      ;; Back in the second one, whose line has moved in the meantime.
+      (syringe-test-edit-main (lambda () (insert "// one\n// two\n")))
+      (syringe--open-chat second)
+      (syringe-test-say "still sure?")
+      (should (equal (syringe-test-prompt)
+                     (concat "Back to the conversation about src/main.rs:30."
+                             "  The line this conversation is about has "
+                             "moved: it is now src/main.rs:32."
+                             "\n\nMy message:\nstill sure?"))))))
+
+(ert-deftest syringe-test-one-message-at-a-time ()
+  "The robot works on one message, and the others wait for their turn."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((first (syringe-test-dot 5))
+          (second (syringe-test-dot 30))
+          (third (syringe-test-dot 50))
+          (stale nil))
+      (pcase-dolist (`(,conversation . ,text)
+                     `((,first . "one?") (,second . "two?") (,third . "three?")))
+        (syringe--open-chat conversation)
+        (syringe-test-say text))
+      ;; Only the first message is with the robot.
+      (should (= (length syringe-test-sent) 1))
+      (should (string-suffix-p "one?" (syringe-test-prompt)))
+      (dolist (conversation (list second third))
+        (should (eq (syringe-conversation-state conversation) 'thinking))
+        (should (string-search "waiting for the robot to answer in \
+src/main.rs:5"
+                               (syringe-test-header conversation))))
+      ;; A conversation that is removed while it waits is never sent.
+      (syringe--delete-conversation second)
+      (syringe-test-answer "the first answer")
+      (should (= (length syringe-test-sent) 1))
+      (should (string-suffix-p "three?" (syringe-test-prompt)))
+      (should-not (string-search "waiting"
+                                 (syringe-test-header third)))
+      ;; Removing the conversation that the robot is working on frees
+      ;; the robot for the message that waits.
+      (syringe--open-chat first)
+      (syringe-test-say "one more?")
+      (should (= (length syringe-test-sent) 1))
+      (setq stale (pop syringe-test-sent))
+      (syringe--delete-conversation third)
+      (should (= (length syringe-test-sent) 1))
+      (should (string-suffix-p "one more?" (syringe-test-prompt)))
+      ;; What the stopped robot still says about the removed one changes
+      ;; nothing.
+      (funcall (nth 3 stale) t "too late")
+      (should (eq (syringe-conversation-state first) 'thinking))
+      (should (= (length syringe-test-sent) 1))
+      (syringe-test-answer "the last answer")
+      (should (equal (car (last (syringe-conversation-messages first)))
+                     '(robot . "the last answer"))))))
 
 (ert-deftest syringe-test-line-told ()
   "A message says so when its line has moved, changed or got lost."
@@ -1273,9 +1312,7 @@ code: it was deleted or rewritten.")))
         (should (eq (syringe-conversation-state conversation) 'error))
         (should (equal (mapcar #'car
                                (syringe-conversation-messages conversation))
-                       '(user error)))
-        ;; The robot may never have heard of the conversation.
-        (should-not (syringe-conversation-session conversation))))))
+                       '(user error)))))))
 
 ;;;; The engine
 
