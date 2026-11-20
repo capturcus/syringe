@@ -1762,6 +1762,7 @@ of it change nothing"))))
              (syringe--new-review root diff kind commit))))
     (syringe--show-diff-buffer)))
 
+;;;###autoload
 (defun syringe-start-last-commit (directory)
   "Start a review of the last commit in the repository of DIRECTORY.
 The diff shows what the commit you have checked out changed, and on
@@ -1774,6 +1775,7 @@ See `syringe--start' for what starting a review does."
   (interactive (list (syringe--read-directory)))
   (syringe--start directory 'last-commit))
 
+;;;###autoload
 (defun syringe-start-unstaged (directory)
   "Start a review of the uncommitted work in the repository of DIRECTORY.
 The diff shows the unstaged changes, as `git diff' prints them, and
@@ -1984,6 +1986,7 @@ checked out and the number of conversations."
                                       50 nil nil t)
             (length (plist-get data :conversations)))))
 
+;;;###autoload
 (defun syringe-restore (directory)
   "Open a saved review of the git repository that contains DIRECTORY.
 Choose it from a list, the newest first.  A line shows when the
