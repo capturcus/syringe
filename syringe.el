@@ -1426,5 +1426,151 @@ that is checked out.  The dots go to where their lines are now."
       (syringe--show-diff-buffer)
       (syringe--refresh-soon))))
 
+;;;; The engine: GitHub Copilot CLI
+
+;; Everything above reaches the robot through three functions only:
+;;
+;;   (syringe-engine-new-session)
+;;       Return a new session.  A session is a string that names one
+;;       conversation with the robot.
+;;   (syringe-engine-fork SESSION)
+;;       Return a new session that continues from a copy of SESSION.
+;;   (syringe-engine-send SESSION PROMPT DIRECTORY ON-ACTIVITY ON-DONE)
+;;       Send PROMPT in SESSION, with the robot working in DIRECTORY.
+;;       Return at once with the process.  While the robot works, call
+;;       ON-ACTIVITY with a few words about what it is doing.  At the
+;;       end call ON-DONE with t and the answer, or with nil and the
+;;       reason for the failure.
+;;
+;; To use another coding agent, rewrite these three functions.
+
+(defcustom syringe-copilot-program "copilot"
+  "The GitHub Copilot CLI program."
+  :type 'string)
+
+(defcustom syringe-copilot-args
+  '("--no-ask-user"
+    "--deny-tool=write"
+    "--allow-tool=shell(git diff)" "--allow-tool=shell(git log)"
+    "--allow-tool=shell(git show)" "--allow-tool=shell(git blame)"
+    "--allow-tool=shell(git status)" "--allow-tool=shell(git grep)"
+    "--allow-tool=shell(git ls-files)" "--allow-tool=shell(rg)"
+    "--allow-tool=shell(grep)" "--allow-tool=shell(ls)"
+    "--allow-tool=shell(cat)" "--allow-tool=shell(head)"
+    "--allow-tool=shell(tail)" "--allow-tool=shell(wc)"
+    "--model" "gpt-6-astra")
+  "Arguments for every run of Copilot.
+The default keeps the robot read-only: it may not write files, and
+the only commands it may run without asking are the ones listed.
+Copilot cannot ask for permission here, so it refuses the rest.
+To choose the model, add \"--model\" and its name."
+  :type '(repeat string))
+
+(defun syringe-engine-new-session ()
+  "Return a new session: a random UUID, which Copilot wants as the name."
+  (format "%08x-%04x-4%03x-%04x-%06x%06x"
+          (random #x100000000) (random #x10000) (random #x1000)
+          (+ #x8000 (random #x4000))
+          (random #x1000000) (random #x1000000)))
+
+(defun syringe-engine-fork (session)
+  "Return a new session that continues from a copy of SESSION.
+Copilot can fork a session only from its interactive prompt, so this
+copies the directory where Copilot keeps the session and renames the
+session inside the two files that hold its name.  It relies on how
+Copilot 1.0 stores sessions, which its documentation does not promise."
+  (let* ((new (syringe-engine-new-session))
+         (store (expand-file-name "session-state"
+                                  (or (getenv "COPILOT_HOME") "~/.copilot")))
+         (to (expand-file-name new store)))
+    (copy-directory (expand-file-name session store) to)
+    (dolist (name '("workspace.yaml" "events.jsonl"))
+      (let ((file (expand-file-name name to))
+            (coding-system-for-read 'utf-8)
+            (coding-system-for-write 'utf-8))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (while (search-forward session nil t)
+            (replace-match new t t))
+          (write-region nil nil file nil 'silent))))
+    new))
+
+(defun syringe-copilot--activity (data directory)
+  "Describe the tool call DATA of a Copilot event in a few words.
+File names are shown relative to DIRECTORY."
+  (or (ignore-errors
+        (let-alist data
+          (let ((what (or .arguments.path .arguments.command
+                          .arguments.pattern .arguments.query "")))
+            (when (file-name-absolute-p what)
+              (setq what (file-relative-name what directory)))
+            (truncate-string-to-width
+             (string-replace "\n" " "
+                             (string-trim (format "%s %s"
+                                                  (or .toolTitle .toolName)
+                                                  what)))
+             70 nil nil t))))
+      "working"))
+
+(defun syringe-engine-send (session prompt directory on-activity on-done)
+  "Send PROMPT to Copilot in SESSION, working in DIRECTORY.
+Return the process.  Call ON-ACTIVITY with a string whenever Copilot
+starts to use a tool.  When it ends, call ON-DONE with t and its
+answer, or with nil and the reason it failed."
+  (unless (executable-find syringe-copilot-program)
+    (error "Cannot find the program `%s'" syringe-copilot-program))
+  (let* ((default-directory (file-name-as-directory directory))
+         (answer nil)                   ; the last text Copilot wrote
+         (errors "")                    ; output that is not JSON
+         (rest "")                      ; an incomplete last line
+         (process
+          (make-process
+           :name "syringe-copilot"
+           :command (append (list syringe-copilot-program
+                                  "--session-id" session
+                                  "--output-format" "json")
+                            syringe-copilot-args
+                            (list "-p" prompt))
+           :connection-type 'pipe
+           :coding 'utf-8
+           :noquery t
+           :filter
+           (lambda (_process chunk)
+             ;; Copilot prints one JSON object per line, and a chunk
+             ;; can end in the middle of a line.
+             (let ((lines (split-string (concat rest chunk) "\n")))
+               (setq rest (car (last lines)))
+               (dolist (line (butlast lines))
+                 (let ((event (ignore-errors
+                                (json-parse-string line :object-type 'alist
+                                                   :null-object nil
+                                                   :false-object nil))))
+                   (if (not (consp event))
+                       ;; Copilot prints its error messages as plain text.
+                       (setq errors (concat errors line "\n"))
+                     (let-alist event
+                       (pcase .type
+                         ("tool.execution_start"
+                          (funcall on-activity
+                                   (syringe-copilot--activity .data directory)))
+                         ;; Copilot writes several messages while it
+                         ;; works; the last one with text is the answer.
+                         ("assistant.message"
+                          (when (and (stringp .data.content)
+                                     (not (string-blank-p .data.content)))
+                            (setq answer .data.content))))))))))
+           :sentinel
+           (lambda (process _event)
+             (unless (process-live-p process)
+               (if (and answer (eq (process-exit-status process) 0))
+                   (funcall on-done t (string-trim answer))
+                 (let ((why (string-trim (concat errors rest))))
+                   (funcall on-done nil (if (string-empty-p why)
+                                            "Copilot gave no answer"
+                                          why)))))))))
+    ;; Copilot gets the prompt as an argument; do not let it wait for input.
+    (process-send-eof process)
+    process))
+
 (provide 'syringe)
 ;;; syringe.el ends here
