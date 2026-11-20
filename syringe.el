@@ -3,13 +3,14 @@
 ;;; Commentary:
 
 ;; Syringe helps you understand a change by reading it yourself.
-;; A review uses two windows:
+;; A review uses three windows:
 ;;
 ;;   diff          what changed, under the message of the commit; RET
 ;;                 goes to that place in the live code
 ;;   live code     the real files, to read around in and to edit
+;;   conversation  what you write about one line
 ;;
-;; A dot in the left margin marks a line that you want to talk about.
+;; A dot in the left margin marks a line that has a conversation.
 ;;
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
@@ -20,8 +21,8 @@
 ;;                              the work on top of it that is not committed
 ;;   syringe-start-unstaged     start a review of the unstaged changes and
 ;;                              the new files
-;;   syringe-toggle-dot         put a dot on this line, or remove the dot
-;;                              that is there
+;;   syringe-toggle-dot         put a dot on this line and open its
+;;                              conversation, or remove the dot that is there
 ;;   syringe-next-dot           jump to the next dot
 ;;   syringe-previous-dot       jump to the previous dot
 
@@ -45,15 +46,25 @@ When nil, the code window shows the place but the cursor stays in the diff."
 (defface syringe-dot '((t :foreground "DodgerBlue" :weight bold))
   "Face of a dot in the left margin.")
 
+(defface syringe-user '((t :inherit font-lock-keyword-face))
+  "Face of your messages in a conversation.")
+
+(defface syringe-prompt '((t :inherit minibuffer-prompt))
+  "Face of the prompt in a conversation.")
+
 ;;;; Conversations and their dots
 
-;; A dot is an overlay on one line that draws the dot in the left
-;; margin and points to its conversation.
+;; A conversation is the data: a title and the messages.  A dot is an
+;; overlay on one line that draws the dot in the left margin and points
+;; to its conversation.
 
 (cl-defstruct (syringe-conversation
                (:constructor syringe--conversation-create)
                (:copier nil))
   "A conversation about one line, which a dot marks."
+  title            ; where the line is, a string such as "src/main.rs:42"
+  messages         ; (ROLE . TEXT) pairs, oldest first; see `syringe--say'
+  buffer           ; the buffer that shows the conversation, or nil
   diff-dot         ; the dot in the diff, or nil
   code-dot)        ; the dot in the live code, or nil
 
@@ -136,32 +147,54 @@ Do nothing if that line already has a dot."
                    (syringe-conversation-code-dot conversation)))))
 
 (defun syringe--drop (conversation)
-  "Take CONVERSATION off the screen: remove its dots."
+  "Take CONVERSATION off the screen.
+That is its dots and its buffer."
   (dolist (dot (syringe--live-dots conversation))
     (with-current-buffer (overlay-buffer dot)
       (delete-overlay dot)
-      (syringe--sync))))
+      (syringe--sync)))
+  (when (buffer-live-p (syringe-conversation-buffer conversation))
+    (kill-buffer (syringe-conversation-buffer conversation))))
 
 (defun syringe--delete-conversation (conversation)
   "Delete CONVERSATION for good."
   (setq syringe--conversations (delq conversation syringe--conversations))
   (syringe--drop conversation))
 
+(defun syringe--file-title ()
+  "Return the current buffer's file relative to its repository, or its name."
+  (let ((root (and buffer-file-name
+                   (locate-dominating-file buffer-file-name ".git"))))
+    (if root
+        (file-relative-name buffer-file-name root)
+      (buffer-name))))
+
+(defun syringe--line-title ()
+  "Return a name for the current line, such as \"src/main.c:42\"."
+  (format "%s:%d" (syringe--file-title) (line-number-at-pos nil t)))
+
 (defun syringe--add-dot ()
   "Start a conversation about the current line and return it.
 Put a dot on the line."
-  (let ((conversation (syringe--conversation-create)))
+  (let ((conversation (syringe--conversation-create
+                       :title (syringe--line-title))))
     (push conversation syringe--conversations)
     (syringe--make-dot conversation (current-buffer) (point))
     conversation))
 
 (defun syringe-toggle-dot ()
-  "Put a dot on the current line, or remove the dot that is on it."
+  "Put a dot on the current line, or remove the dot that is on it.
+A new dot starts a conversation and opens it.
+
+Removing a dot removes its conversation; this asks first when the
+conversation has messages."
   (interactive)
   (let ((conversation (syringe--conversation-at-line)))
-    (if conversation
-        (syringe--delete-conversation conversation)
-      (syringe--add-dot))))
+    (cond ((null conversation)
+           (syringe--open-chat (syringe--add-dot)))
+          ((or (null (syringe-conversation-messages conversation))
+               (y-or-n-p "Delete this dot and its conversation? "))
+           (syringe--delete-conversation conversation)))))
 
 (defun syringe-next-dot ()
   "Jump to the next dot below the current line."
@@ -184,10 +217,13 @@ Put a dot on the line."
 ;; close them; a window that is needed and missing is made again.
 
 (defun syringe--window-role (window)
-  "Return what WINDOW shows: `diff', `code', or nil.
-`code' is any ordinary window that does not show the diff."
+  "Return what WINDOW shows: `diff', `chat', `code', or nil.
+`code' is any ordinary window that shows neither the diff nor a
+conversation."
   (let ((buffer (window-buffer window)))
     (cond ((equal (buffer-name buffer) syringe--diff-buffer) 'diff)
+          ((eq (buffer-local-value 'major-mode buffer) 'syringe-chat-mode)
+           'chat)
           ((or (window-dedicated-p window)
                (window-parameter window 'window-side))
            nil)
@@ -202,12 +238,19 @@ Of several such windows, return the most recently used one."
              (lambda (a b) (> (window-use-time a) (window-use-time b))))))
 
 (defun syringe--make-window (role)
-  "Create and return a window for ROLE, which is `code'.
-The code goes to the right of the diff.  Without a diff window, the
-selected window is split."
-  (let ((diff (syringe--window 'diff)))
+  "Create and return a window for ROLE, which is `code' or `chat'.
+The code goes to the right of the diff and the conversation below
+the code.  Without a diff window, the selected window is split."
+  (let ((diff (syringe--window 'diff))
+        (code (syringe--window 'code))
+        (chat (syringe--window 'chat)))
     (pcase role
-      ('code (split-window diff nil 'right)))))
+      ('code (if chat
+                 (split-window chat nil 'above)
+               (split-window diff nil 'right)))
+      ('chat (if code
+                 (split-window code nil 'below)
+               (split-window diff nil 'right))))))
 
 (defun syringe--show (buffer role)
   "Show BUFFER in the window for ROLE, creating that window if needed.
@@ -227,6 +270,124 @@ With SELECT non-nil, go to that window too."
       (pulse-momentary-highlight-one-line (point)))
     (when select
       (select-window win))))
+
+;;;; The conversation buffer
+
+;; Every conversation has its own buffer.  It holds the old messages,
+;; which are read-only, then a prompt, then the text being typed.  The
+;; messages are stored in the conversation, so the buffer can be killed
+;; and drawn again.
+
+(defconst syringe--prompt "> "
+  "The prompt shown before the text being typed.")
+
+(defvar-local syringe--conversation nil
+  "The conversation that this buffer shows.")
+
+(defvar-local syringe--input-start nil
+  "Marker at the start of the text being typed, just after the prompt.")
+
+(defvar-keymap syringe-chat-mode-map
+  "RET" #'syringe-chat-send)
+
+(define-derived-mode syringe-chat-mode nil "Syringe-Chat"
+  "Major mode for a syringe conversation.
+Type after the prompt and press RET to send the message."
+  (setq-local word-wrap t)
+  (setq-local truncate-lines nil)
+  (add-hook 'kill-buffer-hook #'syringe--leave-windows nil t))
+
+(defun syringe--chat-header ()
+  "Return the header line of a conversation buffer: its title."
+  (let ((conversation syringe--conversation))
+    (when conversation
+      ;; A % would be read as a mode line construct.
+      (string-replace
+       "%" "%%"
+       (concat " " (syringe-conversation-title conversation))))))
+
+(defun syringe--leave-windows ()
+  "Take the conversation buffer that is being killed out of its windows.
+Emacs would put some other buffer there, and the window would then
+count as a code window.  Show another conversation instead, or close
+the window if there is none."
+  (let ((other (seq-find (lambda (buffer)
+                           (and (buffer-live-p buffer)
+                                (not (eq buffer (current-buffer)))))
+                         (mapcar #'syringe-conversation-buffer
+                                 syringe--conversations))))
+    (dolist (win (get-buffer-window-list nil nil t))
+      (if other
+          (set-window-buffer win other)
+        ;; The only window of a frame cannot be closed.
+        (ignore-errors (delete-window win))))))
+
+(defun syringe--render-message (role text)
+  "Insert the message TEXT, written by ROLE, just above the prompt."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (- syringe--input-start (length syringe--prompt)))
+      (insert (propertize (concat text "\n")
+                          'face (pcase role
+                                  ('user 'syringe-user))
+                          'read-only t
+                          'front-sticky '(read-only))))))
+
+(defun syringe--say (conversation role text)
+  "Add the message TEXT, written by ROLE, to CONVERSATION.
+ROLE is `user'; nobody else writes yet."
+  (setf (syringe-conversation-messages conversation)
+        (append (syringe-conversation-messages conversation)
+                (list (cons role text))))
+  (let ((buffer (syringe-conversation-buffer conversation)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (syringe--render-message role text)))))
+
+(defun syringe-chat-send ()
+  "Add the text typed after the prompt to the conversation."
+  (interactive)
+  (let ((conversation syringe--conversation)
+        (text (string-trim (buffer-substring-no-properties
+                            syringe--input-start (point-max)))))
+    (when (string-empty-p text)
+      (user-error "Type a message first"))
+    (delete-region syringe--input-start (point-max))
+    (syringe--say conversation 'user text)
+    (goto-char (point-max))))
+
+(defun syringe--chat-buffer (conversation)
+  "Return the buffer that shows CONVERSATION, creating it if needed."
+  (let ((buffer (syringe-conversation-buffer conversation))
+        (title (syringe-conversation-title conversation)))
+    (unless (buffer-live-p buffer)
+      (setq buffer (generate-new-buffer (format "*syringe: %s*" title)))
+      (setf (syringe-conversation-buffer conversation) buffer)
+      (with-current-buffer buffer
+        (syringe-chat-mode)
+        ;; Line numbers make no sense in a chat.  This has to come after
+        ;; the mode: `global-display-line-numbers-mode' turns them on then.
+        (display-line-numbers-mode -1)
+        (setq syringe--conversation conversation
+              header-line-format '(:eval (syringe--chat-header)))
+        ;; `rear-nonsticky' lets you type after the prompt even though
+        ;; the prompt is read-only.  `field' makes C-a stop after it.
+        (insert (propertize syringe--prompt
+                            'face 'syringe-prompt
+                            'field 'prompt
+                            'read-only t
+                            'front-sticky '(read-only)
+                            'rear-nonsticky t))
+        (setq syringe--input-start (point-marker))
+        (pcase-dolist (`(,role . ,text)
+                       (syringe-conversation-messages conversation))
+          (syringe--render-message role text))))
+    buffer))
+
+(defun syringe--open-chat (conversation)
+  "Show CONVERSATION in the conversation window and go there."
+  (select-window (syringe--show (syringe--chat-buffer conversation) 'chat))
+  (goto-char (point-max)))
 
 ;;;; The diff
 
@@ -351,8 +512,9 @@ diff, as `git log' prints it."
 (defun syringe--start (directory kind)
   "Start a review of KIND in the repository that contains DIRECTORY.
 KIND is `last-commit' or `unstaged'.  Show the diff in the selected
-window, or in the window that already shows a diff.  The code window
-appears when it is first needed.  The review that was open is closed."
+window, or in the window that already shows a diff.  The code and
+conversation windows appear when they are first needed.  The review
+that was open is closed."
   (let* ((root (syringe--repository directory))
          (diff (syringe--change-diff root kind)))
     (when (string-empty-p diff)
