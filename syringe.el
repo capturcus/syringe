@@ -40,7 +40,9 @@
 ;;   syringe-restore            open a saved review
 ;;
 ;; A review is saved as you go, in the directory syringe inside the
-;; repository's .git, so it is never committed.
+;; repository's .git, so it is never committed.  A review belongs to
+;; the commit that was checked out when it started: starting a review
+;; on a commit that already has a saved review opens that one again.
 
 ;;; Code:
 
@@ -1161,20 +1163,44 @@ KIND is `last-commit' or `unstaged'.  Show the diff in the selected
 window, or in the window that already shows a diff.  The code and
 conversation windows appear when they are first needed.
 
+A review belongs to the commit that is checked out.  If the open
+review is this one already, only take its diff again.  If a review
+of this kind and commit is saved, open it, with its conversations.
+Else start a new one.  The review that was open is saved and closed.
+
 The review is saved as you go, and its diff follows the code: see
-`syringe--refresh-diff'.  The review that was open is saved and
-closed."
+`syringe--refresh-diff'."
   (let* ((root (syringe--repository directory))
          (commit (syringe--git root "rev-parse" "HEAD"))
-         (diff (syringe--change-diff root kind)))
-    (when (string-empty-p diff)
-      (user-error
-       (pcase kind
-         ('unstaged
-          "Nothing to review: no unstaged changes and no new files")
-         (_ "Nothing to review: the last commit and the work on top \
+         (this (lambda (about)
+                 (and (eq kind (plist-get about :kind))
+                      (equal commit (plist-get about :commit)))))
+         (saved nil))
+    (cond ((and syringe--file
+                (equal root syringe--root)
+                (funcall this syringe--about)
+                (get-buffer syringe--diff-buffer))
+           (syringe--refresh-diff))
+          ((setq saved
+                 (seq-find (lambda (file)
+                             (funcall this (plist-get
+                                            (ignore-errors
+                                              (read (syringe--read-text file)))
+                                            :about)))
+                           (syringe--review-files root)))
+           (syringe--open-review saved root)
+           (syringe--refresh-diff)
+           (message "Syringe: opened the saved review of this commit"))
+          (t
+           (let ((diff (syringe--change-diff root kind)))
+             (when (string-empty-p diff)
+               (user-error
+                (pcase kind
+                  ('unstaged
+                   "Nothing to review: no unstaged changes and no new files")
+                  (_ "Nothing to review: the last commit and the work on top \
 of it change nothing"))))
-    (syringe--new-review root diff kind commit)
+             (syringe--new-review root diff kind commit))))
     (syringe--show-diff-buffer)))
 
 (defun syringe-start-last-commit (directory)
