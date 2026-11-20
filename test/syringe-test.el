@@ -750,5 +750,153 @@ diff --git a/two.txt b/two.txt
       (find-file-noselect (syringe-test-path "src/main.rs"))
       (should (equal (syringe-test-dots (syringe-test-main)) '(10 30))))))
 
+;;;; Saved reviews
+
+(defun syringe-test-saved ()
+  "Return what the file of the open review holds."
+  (read (syringe--read-text syringe--file)))
+
+(defun syringe-test-choose (choice function)
+  "Call FUNCTION and answer the completion that it asks for with CHOICE.
+CHOICE is the number of a choice, counted from 0, or a text that
+the choice has.  Return the choices that were offered, in order."
+  (let ((offered nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt table &rest _)
+                 (setq offered (all-completions "" table))
+                 (if (numberp choice)
+                     (nth choice offered)
+                   (seq-find (lambda (line) (string-search choice line))
+                             offered)))))
+      (funcall function))
+    offered))
+
+(ert-deftest syringe-test-saved-as-you-go ()
+  "A review is on disk, in the git directory, after every change to it."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (should (file-in-directory-p syringe--file
+                                 (syringe-test-path ".git/syringe")))
+    (should (equal (syringe--read-text (syringe--diff-file syringe--file))
+                   (syringe-test-diff)))
+    (should-not (plist-get (syringe-test-saved) :conversations))
+    (syringe-test-dot 30)
+    (syringe-test-say "why?")
+    (let ((saved (car (plist-get (syringe-test-saved) :conversations))))
+      (should (equal (plist-get saved :title) "src/main.rs:30"))
+      (should (equal (plist-get saved :code-text) (syringe-test-line 30)))
+      (should (equal (plist-get saved :messages) '((user . "why?")))))
+    ;; Git does not see the saved review.
+    (should (equal (syringe-test-git "status" "--porcelain") ""))))
+
+(ert-deftest syringe-test-restore ()
+  "A saved review is opened from the list, with its conversations and dots."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-in-diff "CHANGED ten")
+    (syringe-toggle-dot)
+    (syringe-test-say "why ten?")
+    (syringe-test-answer "because")
+    (syringe-test-in-diff "-fn function_40")
+    (syringe-toggle-dot)
+    (let ((in-diff (syringe-test-dots syringe--diff-buffer)))
+      (should (= (length in-diff) 2))
+      (syringe--close-review)
+      (should-not syringe--conversations)
+      (should-not (syringe-test-dots syringe--diff-buffer))
+      (should-not (syringe-test-dots (syringe-test-main)))
+      (let ((offered (syringe-test-choose
+                      0 (lambda () (syringe-restore syringe-test-root)))))
+        (should (= (length offered) 1))
+        (should (string-search "last commit" (car offered)))
+        (should (string-search "2 conversations" (car offered))))
+      (should (equal (mapcar #'syringe-conversation-title
+                             syringe--conversations)
+                     '("src/main.rs:40 (removed)" "src/main.rs:10")))
+      (should (equal (syringe-conversation-messages
+                      (cadr syringe--conversations))
+                     '((user . "why ten?") (robot . "because"))))
+      (should (equal (syringe-test-dots syringe--diff-buffer) in-diff))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(10)))
+      ;; The robot has read the change and is not asked to read it again.
+      (should-not syringe-test-sent))))
+
+(ert-deftest syringe-test-start-again ()
+  "Starting a review of a commit that has a review opens that review."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-dot 30)
+    (let ((file syringe--file))
+      ;; While the review is open:
+      (syringe-start-last-commit syringe-test-root)
+      (should (equal syringe--file file))
+      (should (= (length syringe--conversations) 1))
+      ;; And after it was closed:
+      (syringe--close-review)
+      (syringe-start-last-commit syringe-test-root)
+      (should (equal syringe--file file))
+      (should (= (length syringe--conversations) 1))
+      (should (equal (syringe-test-dots (syringe-test-main)) '(30)))
+      (should-not syringe-test-sent)
+      ;; A review of the unstaged changes is another review.
+      (syringe-test-write "notes.txt" "not committed\n" t)
+      (syringe-start-unstaged syringe-test-root)
+      (syringe-test-answer "ready")
+      (should-not (equal syringe--file file))
+      (should (eq (plist-get syringe--about :kind) 'unstaged))
+      (should-not syringe--conversations)
+      (syringe-start-last-commit syringe-test-root)
+      (should (equal syringe--file file))
+      (should (= (length syringe--conversations) 1)))))
+
+(ert-deftest syringe-test-diff-follows-code ()
+  "The diff is taken again after an edit, and the conversations stay."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-in-diff "CHANGED ten")
+    (syringe-toggle-dot)
+    (let ((conversation (car syringe--conversations)))
+      (syringe-test-edit-main (lambda () (insert "// new\n")))
+      ;; Saving asks for the diff once Emacs is idle; do not wait for that.
+      (should (timerp syringe--refresh-timer))
+      (syringe--refresh-if-current)
+      (should (string-search "\n+// new\n" (syringe-test-diff)))
+      (should (equal (syringe--read-text (syringe--diff-file syringe--file))
+                     (syringe-test-diff)))
+      (should (equal (syringe-conversation-title conversation)
+                     "src/main.rs:11"))
+      (with-current-buffer syringe--diff-buffer
+        (goto-char (overlay-start
+                    (syringe-conversation-diff-dot conversation)))
+        (should (equal (buffer-substring-no-properties (pos-bol) (pos-eol))
+                       (concat "+" (syringe-test-line 10 "CHANGED ten"))))))))
+
+(ert-deftest syringe-test-other-commit ()
+  "A review keeps its diff when its commit is left, until it is carried over."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (syringe-test-dot 30)
+    (let ((commit (plist-get syringe--about :commit)))
+      (syringe-test-write "notes.txt" "fourth note\n" t)
+      (syringe-test-git "commit" "-q" "--all" "-m" "three")
+      (syringe--refresh-if-current)
+      (should (string-search "CHANGED ten" (syringe-test-diff)))
+      ;; `g' in the diff offers to carry the review over.
+      (setq syringe-test-yes nil)
+      (with-current-buffer syringe--diff-buffer
+        (should-error (revert-buffer) :type 'user-error))
+      (should (equal (plist-get syringe--about :commit) commit))
+      (should (string-search "CHANGED ten" (syringe-test-diff)))
+      (setq syringe-test-yes t)
+      (with-current-buffer syringe--diff-buffer
+        (revert-buffer))
+      (should (equal (plist-get syringe--about :commit)
+                     (string-trim (syringe-test-git "rev-parse" "HEAD"))))
+      (should-not (string-search "CHANGED ten" (syringe-test-diff)))
+      (should (string-search "\n+fourth note\n" (syringe-test-diff)))
+      (should (= (length syringe--conversations) 1))
+      (should (equal (plist-get (syringe-test-saved) :about)
+                     syringe--about)))))
+
 (provide 'syringe-test)
 ;;; syringe-test.el ends here
