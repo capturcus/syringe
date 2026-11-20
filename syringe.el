@@ -43,7 +43,7 @@
 ;; The windows are recognized by what they show, not by where they are:
 ;; resize them, move buffers between them, close and reopen them.
 ;;
-;; Commands.  Their keys are set at the end of this file.
+;; Commands.  None of them is bound to a key; bind them in your init file.
 ;;
 ;;   syringe-start-last-commit  start a review of the last commit and of
 ;;                              the work on top of it that is not committed
@@ -55,6 +55,8 @@
 ;;   syringe-next-dot           jump to the next dot
 ;;   syringe-previous-dot       jump to the previous dot
 ;;   syringe-list-dots          choose a dot from a list and jump to it
+;;   syringe-next-link          in a conversation, go to the next link
+;;   syringe-previous-link      in a conversation, go to the previous link
 ;;   syringe-restore            open a saved review
 ;;
 ;; A review is saved as you go, in the directory syringe inside the
@@ -2155,19 +2157,6 @@ answer, or with nil and the reason it failed."
     ;; Copilot gets the prompt as an argument; do not let it wait for input.
     (process-send-eof process)
     process))
-
-(global-set-key (kbd "C-j") #'syringe-toggle-dot)
-(global-set-key (kbd "C-o") #'syringe-open-conversation)
-(global-set-key (kbd "M-j") #'syringe-next-dot)
-(global-set-key (kbd "M-k") #'syringe-previous-dot)
-(global-set-key (kbd "M-l") #'syringe-list-dots)
-
-;; In a diff M-k kills a hunk; there too it goes to the previous dot.
-(keymap-set syringe-diff-mode-map "M-k" #'syringe-previous-dot)
-
-;; A conversation has no dots; there the same keys go through the links.
-(keymap-set syringe-chat-mode-map "M-j" #'syringe-next-link)
-(keymap-set syringe-chat-mode-map "M-k" #'syringe-previous-link)
 
 (provide 'syringe)
 ;;; syringe.el ends here

@@ -28,7 +28,6 @@ The subject of a commit starts with the part that it changes.  For
     robot     what the robot is told and what is done with its answers
     engine    the three functions that run the robot
     reviews   saving reviews and opening them again
-    keys      the key bindings at the end of the file
 
 What makes the file a package that can be installed, its headers and
 its autoload cookies, is `package`.
