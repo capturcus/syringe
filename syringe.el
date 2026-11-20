@@ -101,8 +101,16 @@ Files that git ignores are left out."
 It shows the code as it is now: the work that is not committed and
 the files that git does not track are part of it.  A review of the
 last commit starts from the commit before it, a review of the
-unstaged changes from what is staged."
-  (concat (syringe--git-diff root (pcase kind
+unstaged changes from what is staged.
+
+A review of the last commit has the message of that commit above the
+diff, as `git log' prints it."
+  (concat (pcase kind
+            ('unstaged "")
+            (_ (concat (syringe--git root "--no-pager" "log" "-1"
+                                     "--no-color" "--format=medium")
+                       "\n\n")))
+          (syringe--git-diff root (pcase kind
                                     ('unstaged nil)
                                     (_ '("HEAD~1"))))
           (syringe--untracked-diff root)))
