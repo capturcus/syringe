@@ -1316,13 +1316,14 @@ code: it was deleted or rewritten.")))
 ;; These tests run the real functions of the engine, with a shell
 ;; script in the place of Copilot.
 
-(defun syringe-test-run-engine (script)
+(defun syringe-test-run-engine (script &optional when-busy)
   "Send a prompt with `syringe-engine-send' to SCRIPT in place of Copilot.
 SCRIPT is the text of a shell script.  Wait until it has ended and
 return (ARGUMENTS ACTIVITIES OK TEXT): the arguments it was run
 with, what `syringe-engine-send' reported as activity, and what it
 reported at the end.  The script runs in a scratch directory, which
-it can name as $PWD."
+it can name as $PWD.  WHEN-BUSY, if given, is called once with the
+process, as soon as an activity of the script has been reported."
   (ert-with-temp-directory directory
     (let* ((syringe-copilot-program (expand-file-name "copilot" directory))
            (arguments (expand-file-name "arguments" directory))
@@ -1339,7 +1340,9 @@ it can name as $PWD."
                       (lambda (ok text) (setq result (list ok text))))))
         (with-timeout (30 (error "The script has not ended"))
           (while (not result)
-            (accept-process-output process 0.1))))
+            (accept-process-output process 0.1)
+            (when (and when-busy activities)
+              (funcall (prog1 when-busy (setq when-busy nil)) process)))))
       (cons (split-string (with-temp-buffer
                             (insert-file-contents arguments)
                             (buffer-string))
@@ -1386,6 +1389,23 @@ END
     (should-error (syringe-engine-send "the-session" "the prompt"
                                        temporary-file-directory
                                        #'ignore #'ignore))))
+
+(ert-deftest syringe-test-engine-stop ()
+  "A robot that is told to stop ends by itself, and that is a failure."
+  (skip-unless (executable-find "sh"))
+  (pcase-let ((`(,_arguments ,_activities ,ok ,text)
+               (syringe-test-run-engine "trap 'echo stopped; exit 130' INT
+cat <<END
+{\"type\":\"assistant.message\",\"data\":{\"content\":\"Let me look.\"}}
+{\"type\":\"tool.execution_start\",\"data\":{\"toolName\":\"shell\"}}
+END
+while :; do sleep 1; done
+"
+                                        #'syringe-engine-stop)))
+    (should-not ok)
+    ;; The script was not killed: it had the time to say this.  What it
+    ;; wrote before it was stopped is no answer.
+    (should (equal text "stopped"))))
 
 (ert-deftest syringe-test-engine-sessions ()
   "A new session has a name of its own, in the form of a UUID."

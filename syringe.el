@@ -1172,7 +1172,7 @@ The answer arrives in the background."
 ;;;; Talking to the robot
 
 ;; This part decides what to tell the robot and what to do with its
-;; answers.  It reaches the robot only through the two functions of
+;; answers.  It reaches the robot only through the three functions of
 ;; the engine, at the end of this file.
 
 (defun syringe--start-session ()
@@ -2015,7 +2015,7 @@ that is checked out.  The dots go to where their lines are now."
 
 ;;;; The engine: GitHub Copilot CLI
 
-;; Everything above reaches the robot through two functions only:
+;; Everything above reaches the robot through three functions only:
 ;;
 ;;   (syringe-engine-new-session)
 ;;       Return a new session.  A session is a string that names one
@@ -2026,8 +2026,13 @@ that is checked out.  The dots go to where their lines are now."
 ;;       ON-ACTIVITY with a few words about what it is doing.  At the
 ;;       end call ON-DONE with t and the answer, or with nil and the
 ;;       reason for the failure.
+;;   (syringe-engine-stop PROCESS)
+;;       Tell the robot that runs as PROCESS to stop working on its
+;;       prompt.  Return at once.  The robot ends soon after, in such
+;;       a way that the session can be used again, and ON-DONE is then
+;;       called with nil.
 ;;
-;; To use another coding agent, rewrite these two functions.
+;; To use another coding agent, rewrite these three functions.
 
 (defcustom syringe-copilot-program "copilot"
   "The GitHub Copilot CLI program."
@@ -2135,6 +2140,14 @@ answer, or with nil and the reason it failed."
     ;; Copilot gets the prompt as an argument; do not let it wait for input.
     (process-send-eof process)
     process))
+
+(defun syringe-engine-stop (process)
+  "Tell Copilot, which runs as PROCESS, to stop working on its prompt.
+Copilot takes an interrupt as you stopping it: it notes in the session
+that the prompt was interrupted, stops the command that it is running
+and exits with a status that is not 0.  The next prompt can then go on
+in the session.  A killed Copilot would do none of that."
+  (interrupt-process process))
 
 (provide 'syringe)
 ;;; syringe.el ends here
