@@ -56,6 +56,8 @@
 ;;   syringe-list-dots          choose a dot from a list and jump to it
 ;;   syringe-next-link          in a conversation, go to the next link
 ;;   syringe-previous-link      in a conversation, go to the previous link
+;;   syringe-chat-abort         in a conversation, stop the robot's work on
+;;                              your last message
 ;;   syringe-restore            open a saved review
 ;;
 ;; A review is saved as you go, in the directory syringe inside the
@@ -222,6 +224,10 @@ It reads the diff or works on a message; there is never more than one.")
 
 (defvar syringe--asking nil
   "The conversation whose message the robot is working on, or nil.")
+
+(defvar syringe--stopping nil
+  "The conversation whose message the robot was told to stop, or nil.
+It is set until the robot has stopped.")
 
 (defvar syringe--asked-last nil
   "The conversation that the robot answered in last, or nil.
@@ -984,7 +990,8 @@ With SELECT non-nil, go to that window too."
 (define-derived-mode syringe-chat-mode nil "Syringe-Chat"
   "Major mode for a syringe conversation.
 Type after the prompt and press RET to send the message.  While the
-robot thinks, the prompt shows ... and nothing can be typed."
+robot thinks, the prompt shows ... and nothing can be typed;
+`syringe-chat-abort' stops the robot."
   (setq-local word-wrap t)
   (setq-local truncate-lines nil)
   (add-hook 'kill-buffer-hook #'syringe--leave-windows nil t)
@@ -1133,6 +1140,19 @@ The answer arrives in the background."
     (syringe--say conversation 'user text)
     (goto-char (point-max))
     (syringe--ask conversation text)))
+
+(defun syringe-chat-abort ()
+  "Stop the robot's work on your last message in this conversation.
+The conversation then says that the message was interrupted, and you
+can send another one.  A message that still waits for the robot is
+not sent at all.  One that the robot was working on it may remember:
+stopping the robot does not take the message back."
+  (interactive)
+  (unless (derived-mode-p 'syringe-chat-mode)
+    (user-error "This is not a conversation"))
+  (unless (eq (syringe-conversation-state syringe--conversation) 'thinking)
+    (user-error "No message of this conversation waits for an answer"))
+  (syringe--interrupt syringe--conversation))
 
 (defun syringe--chat-buffer (conversation)
   "Return the buffer that shows CONVERSATION, creating it if needed."
@@ -1346,23 +1366,54 @@ M-x syringe-start")))
 (defun syringe--answer (conversation ok text)
   "Take the robot's reply to the last message in CONVERSATION.
 OK is non-nil if the robot answered; TEXT is then its answer, and
-otherwise the reason it failed.  After that the robot is free for
-the next message that waits."
+otherwise the reason it failed.  A robot that was told to stop
+fails too, but then the conversation says that you interrupted the
+message.  After that the robot is free for the next message that
+waits."
   (when (eq conversation syringe--asking)
     (setq syringe--asking nil))
-  (when (memq conversation syringe--conversations)
-    (syringe--say conversation (if ok 'robot 'error) text)
-    (cond ((not ok)
-           (syringe--set-state conversation 'error))
-          ;; You are in the conversation right now.
-          ((eq (window-buffer) (syringe-conversation-buffer conversation))
-           (syringe--set-state conversation 'read))
-          (t
-           (syringe--set-state conversation 'unread)
-           (message "Syringe: the robot answered in %s"
-                    (syringe-conversation-title conversation))))
-    (syringe--save))
+  (cond ((not (memq conversation syringe--conversations)))
+        ((and (not ok) (eq conversation syringe--stopping))
+         (syringe--say-interrupted conversation))
+        (t
+         (syringe--say conversation (if ok 'robot 'error) text)
+         (cond ((not ok)
+                (syringe--set-state conversation 'error))
+               ;; You are in the conversation right now.
+               ((eq (window-buffer) (syringe-conversation-buffer conversation))
+                (syringe--set-state conversation 'read))
+               (t
+                (syringe--set-state conversation 'unread)
+                (message "Syringe: the robot answered in %s"
+                         (syringe-conversation-title conversation))))
+         (syringe--save)))
+  (when (eq conversation syringe--stopping)
+    (setq syringe--stopping nil))
   (syringe--ask-next))
+
+(defun syringe--interrupt (conversation)
+  "Stop your message in CONVERSATION that the robot has not answered yet.
+A message that waits for the robot is not sent.  If the robot is
+working on the message, tell it to stop.  It is not free for the
+next message before it has stopped, so the rest is done then, by
+`syringe--answer'."
+  (cond ((not (eq conversation syringe--asking))
+         (setq syringe--waiting
+               (assq-delete-all conversation syringe--waiting))
+         (syringe--say-interrupted conversation))
+        ;; Telling the robot twice could cut short how it ends.
+        ((not (eq conversation syringe--stopping))
+         (setq syringe--stopping conversation)
+         (syringe--set-state conversation 'thinking "stopping")
+         (when (process-live-p syringe--session-process)
+           (syringe-engine-stop syringe--session-process)))))
+
+(defun syringe--say-interrupted (conversation)
+  "Say in CONVERSATION that you interrupted its last message.
+That is written as an error is, but it is no failure and nothing
+new, so the dot turns blue."
+  (syringe--set-state conversation 'read)
+  (syringe--say conversation 'error "Interrupted before the robot answered."))
 
 ;;;; The diff
 
@@ -1914,6 +1965,7 @@ answered.  Send your message again.")))))
           syringe--session-process nil
           syringe--session-error nil
           syringe--asking nil
+          syringe--stopping nil
           syringe--asked-last nil
           syringe--waiting nil)
     (when (process-live-p process)

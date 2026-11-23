@@ -1232,6 +1232,76 @@ src/main.rs:5"
       (should (equal (car (last (syringe-conversation-messages first)))
                      '(robot . "the last answer"))))))
 
+(ert-deftest syringe-test-abort ()
+  "A message that you stop gets a note in place of an answer, not a failure."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let* ((conversation (syringe-test-dot 30))
+           (state (lambda () (syringe-conversation-state conversation)))
+           (last-message
+            (lambda ()
+              (car (last (syringe-conversation-messages conversation))))))
+      ;; There is nothing to stop yet.
+      (should-error (syringe-chat-abort) :type 'user-error)
+      (syringe-test-say "why?")
+      (syringe-chat-abort)
+      ;; The robot is not free before it has stopped.
+      (should (eq (funcall state) 'thinking))
+      (should (string-search "stopping" (syringe-test-header conversation)))
+      (should buffer-read-only)
+      ;; The engine reports a robot that has stopped as one that failed.
+      (syringe-test-answer "Copilot gave no answer" t)
+      (should (equal (syringe-conversation-messages conversation)
+                     '((user . "why?")
+                       (error . "Interrupted before the robot answered."))))
+      (should (eq (funcall state) 'read))
+      (should (eq (syringe-test-dot-color
+                   (syringe-conversation-code-dot conversation))
+                  'syringe-dot))
+      (should-not (string-search "failed" (syringe-test-header conversation)))
+      (should-not buffer-read-only)
+      ;; The note is written as an error is.
+      (goto-char (point-min))
+      (search-forward "Interrupted")
+      (should (eq (get-text-property (point) 'face) 'syringe-error))
+      ;; The robot may never have heard the message.
+      (syringe-test-say "why, again?")
+      (should (string-prefix-p "This is a new conversation, about src/main.rs:30."
+                               (syringe-test-prompt)))
+      ;; An answer that comes although the robot was told to stop is an
+      ;; answer.
+      (syringe-chat-abort)
+      (syringe-test-answer "because")
+      (should (equal (funcall last-message) '(robot . "because")))
+      ;; After that a failure is a failure again.
+      (syringe-test-say "and then?")
+      (syringe-test-answer "no network" t)
+      (should (eq (funcall state) 'error))
+      (should (equal (funcall last-message) '(error . "no network"))))))
+
+(ert-deftest syringe-test-abort-waiting ()
+  "A message that you stop while it waits for the robot is never sent."
+  (syringe-test-with-repository
+    (syringe-test-start)
+    (let ((first (syringe-test-dot 5))
+          (second (syringe-test-dot 30)))
+      (syringe--open-chat first)
+      (syringe-test-say "one?")
+      (syringe--open-chat second)
+      (syringe-test-say "two?")
+      (syringe-chat-abort)
+      (should (equal (syringe-conversation-messages second)
+                     '((user . "two?")
+                       (error . "Interrupted before the robot answered."))))
+      (should (eq (syringe-conversation-state second) 'read))
+      ;; The robot goes on with the message that it is working on.
+      (should (eq (syringe-conversation-state first) 'thinking))
+      (should (= (length syringe-test-sent) 1))
+      (syringe-test-answer "the first answer")
+      (should (equal (car (last (syringe-conversation-messages first)))
+                     '(robot . "the first answer")))
+      (should-not syringe-test-sent))))
+
 (ert-deftest syringe-test-line-told ()
   "A message says so when its line has moved, changed or got lost."
   (syringe-test-with-repository
