@@ -2043,6 +2043,7 @@ that is checked out.  The dots go to where their lines are now."
     "--allow-tool=shell(grep)" "--allow-tool=shell(ls)"
     "--allow-tool=shell(cat)" "--allow-tool=shell(head)"
     "--allow-tool=shell(tail)" "--allow-tool=shell(wc)"
+    "--allow-tool=shell(gh:*)"
     "--model" "gpt-6.2-astra")
   "Arguments for every run of Copilot.
 The default keeps the robot read-only: it may not write files, and
